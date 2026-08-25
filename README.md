@@ -12,11 +12,51 @@ credenciais do fornecedor em um print de referência.
 ## O que tem aqui
 
 ```
-db/migrations/     schema PostgreSQL (tabelas de controle, staging e fato)
+db/migrations/     schema PostgreSQL (controle, staging, fato e usuários)
 server/            coleta SFTP, pipeline de ingestão, agendador, alertas e API
 web/               console React (Vite + TypeScript)
 shared/            tipos de domínio e contratos da API, usados pelos dois lados
 ```
+
+## Acesso
+
+O console exige login. Nenhuma rota de dados responde sem sessão — nem para
+leitura.
+
+**Primeiro acesso.** Uma instalação nova não tem ninguém cadastrado, e não
+criamos um `admin/admin` padrão de propósito: uma senha conhecida em toda
+instalação é uma porta aberta. Crie o primeiro administrador pela linha de
+comando; a senha é sorteada e exibida uma única vez.
+
+```bash
+npm run usuario --workspace @infoprice/server -- \
+    criar --login seu.login --nome "Seu Nome" --papel administrador
+```
+
+Outros comandos: `listar`, `senha` (redefine), `papel`, `desativar`, `ativar`.
+
+**Papéis.**
+
+| Papel | Pode |
+|---|---|
+| `leitor` | ver todas as telas e exportar relatórios |
+| `operador` | o acima, mais coleta manual, reprocessamento, pausar o agendamento, resolver incidentes e baixar arquivos |
+| `administrador` | o acima, mais a gestão de usuários |
+
+A interface esconde o que o papel não alcança, mas quem garante é o servidor:
+cada rota de ação exige o papel na entrada. O último administrador ativo não
+pode ser rebaixado nem desativado.
+
+**Sessão.** Fica do lado do servidor, num cookie `HttpOnly` + `SameSite=Strict`
+(marque `COOKIE_SEGURO=true` em produção, sob HTTPS). Desativar um usuário ou
+redefinir sua senha encerra as sessões dele na hora, sem esperar expirar.
+
+**Senha.** Guardada com `scrypt` (N=16384), sal por usuário, comparação em tempo
+constante. Mínimo de 10 caracteres misturando letras e números. Senha definida
+por um administrador nasce provisória: o servidor recusa qualquer ação até que
+a pessoa troque. Cinco falhas de login em 15 minutos travam o usuário — e o
+limite por IP é quatro vezes maior, para não punir um escritório inteiro atrás
+do mesmo NAT. Toda tentativa fica registrada em `ctl_tentativa_login`.
 
 ## Configuração e segredos
 
@@ -149,6 +189,15 @@ run, então uma tentativa que falha três vezes abre um incidente, não três.
 | GET | `/api/incidentes` | incidentes e regras de notificação |
 | GET | `/api/precos` | consulta do fato, com origem em cada linha |
 | GET | `/api/config` | conexão, agendamento, destino e tabelas |
+| POST | `/api/sessao` | login |
+| GET | `/api/sessao` | quem está logado |
+| DELETE | `/api/sessao` | logout |
+| POST | `/api/sessao/senha` | troca da própria senha |
+| GET | `/api/usuarios` | lista de usuários (administrador) |
+| POST | `/api/usuarios` | cria usuário (administrador) |
+| PATCH | `/api/usuarios/:id` | edita papel, nome ou situação (administrador) |
+| POST | `/api/usuarios/:id/senha` | redefine senha (administrador) |
+| GET | `/api/usuarios/tentativas` | auditoria de acesso (administrador) |
 | POST | `/api/execucoes` | coleta manual |
 | POST | `/api/execucoes/:id/reprocessar` | reprocessa o run |
 | POST | `/api/arquivos/:id/reprocessar` | reprocessa um arquivo |

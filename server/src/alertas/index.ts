@@ -108,6 +108,7 @@ export async function resolverPorDedupe(
 export async function resolverIncidente(
   codigo: string,
   quem: string,
+  idUsuario?: number,
   resolucao = 'Marcado como resolvido pelo painel',
 ): Promise<boolean> {
   const linha = await consultarUm<{ id: number }>(
@@ -115,10 +116,11 @@ export async function resolverIncidente(
         SET status = 'resolvido',
             resolvido_em = now(),
             resolvido_por = $2,
-            resolucao = $3
+            id_usuario_resolucao = $3,
+            resolucao = $4
       WHERE codigo = $1 AND status = 'aberto'
       RETURNING id`,
-    [codigo, quem, resolucao],
+    [codigo, quem, idUsuario ?? null, resolucao],
   );
   return linha !== null;
 }

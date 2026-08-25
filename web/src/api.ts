@@ -1,5 +1,12 @@
 import type {
   AcaoResposta,
+  AtualizarUsuarioPedido,
+  CriarUsuarioPedido,
+  CriarUsuarioResposta,
+  LoginResposta,
+  SessaoResposta,
+  TentativaLogin,
+  Usuario,
   ConfigResposta,
   DetalheExecucaoResposta,
   IncidentesResposta,
@@ -26,6 +33,9 @@ export class ErroApi extends Error {
 async function pegar<T>(caminho: string, init?: RequestInit): Promise<T> {
   const resposta = await fetch(`${BASE}${caminho}`, {
     ...init,
+    // O cookie de sessão precisa acompanhar toda requisição, inclusive quando
+    // o console for servido de outra origem que não a da API.
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
@@ -54,6 +64,27 @@ function enviar<T>(caminho: string, corpo?: unknown): Promise<T> {
 }
 
 export const api = {
+  // ── Sessão ───────────────────────────────────────────────────────────────
+  sessao: () => pegar<SessaoResposta>('/sessao'),
+  entrar: (login: string, senha: string) =>
+    enviar<LoginResposta>('/sessao', { login, senha }),
+  sair: () => pegar<{ ok: boolean }>('/sessao', { method: 'DELETE' }),
+  trocarSenha: (senhaAtual: string, senhaNova: string) =>
+    enviar<AcaoResposta>('/sessao/senha', { senhaAtual, senhaNova }),
+
+  // ── Usuários (administrador) ─────────────────────────────────────────────
+  usuarios: () => pegar<Usuario[]>('/usuarios'),
+  criarUsuario: (dados: CriarUsuarioPedido) =>
+    enviar<CriarUsuarioResposta>('/usuarios', dados),
+  atualizarUsuario: (id: number, dados: AtualizarUsuarioPedido) =>
+    pegar<Usuario>(`/usuarios/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(dados),
+    }),
+  resetarSenha: (id: number) =>
+    enviar<AcaoResposta & { senhaProvisoria: string }>(`/usuarios/${id}/senha`),
+  tentativasLogin: () => pegar<TentativaLogin[]>('/usuarios/tentativas'),
+
   status: () => pegar<StatusResposta>('/status'),
   painel: (run?: string) =>
     pegar<PainelResposta>(`/painel${run ? `?run=${run}` : ''}`),

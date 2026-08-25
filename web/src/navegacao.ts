@@ -6,7 +6,8 @@ export type Tela =
   | 'arquivos'
   | 'qualidade'
   | 'precos'
-  | 'config';
+  | 'config'
+  | 'usuarios';
 
 export interface ItemNav {
   tela: Tela;
@@ -17,6 +18,22 @@ export interface GrupoNav {
   titulo: string;
   itens: ItemNav[];
 }
+
+/**
+ * Os grupos visíveis dependem do papel: só administrador enxerga a
+ * administração. Esconder é conveniência de interface — quem garante é o
+ * servidor, que recusa a rota.
+ */
+export function gruposPara(podeAdministrar: boolean): GrupoNav[] {
+  return podeAdministrar
+    ? [...GRUPOS_NAV, GRUPO_ADMIN]
+    : GRUPOS_NAV;
+}
+
+export const GRUPO_ADMIN: GrupoNav = {
+  titulo: 'administração',
+  itens: [{ tela: 'usuarios', rotulo: 'Usuários' }],
+};
 
 export const GRUPOS_NAV: GrupoNav[] = [
   {

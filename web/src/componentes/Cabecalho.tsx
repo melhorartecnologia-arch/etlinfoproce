@@ -1,20 +1,27 @@
-import type { StatusResposta } from '@infoprice/shared';
+import type { StatusResposta, UsuarioSessao } from '@infoprice/shared';
+import { MenuUsuario } from './MenuUsuario.js';
 import { dataHoraBR } from '../util.js';
 
 export function Cabecalho({
   status,
+  usuario,
+  podeOperar,
   densidade,
   alternarDensidade,
   aoAlternarAgendamento,
   aoColetar,
-  ocupado,
+  aoSair,
+  aoAvisar,
 }: {
   status: StatusResposta | null;
+  usuario: UsuarioSessao;
+  podeOperar: boolean;
   densidade: string;
   alternarDensidade: () => void;
   aoAlternarAgendamento: () => void;
   aoColetar: () => void;
-  ocupado: boolean;
+  aoSair: () => void;
+  aoAvisar: (texto: string, erro?: boolean) => void;
 }) {
   const pausado = status?.agendamento.pausado ?? false;
   const proxima = status?.agendamento.proximaExecucao;
@@ -56,17 +63,19 @@ export function Cabecalho({
         {densidade === 'compacta' ? 'Densidade compacta' : 'Densidade confortável'}
       </button>
 
-      <button className="botao" onClick={aoAlternarAgendamento}>
-        {pausado ? 'Retomar agendamento' : 'Pausar agendamento'}
-      </button>
+      {podeOperar && (
+        <>
+          <button className="botao" onClick={aoAlternarAgendamento}>
+            {pausado ? 'Retomar agendamento' : 'Pausar agendamento'}
+          </button>
 
-      <button
-        className="botao botao--primario"
-        onClick={aoColetar}
-        disabled={ocupado}
-      >
-        {ocupado ? 'Coleta em andamento…' : 'Coleta manual'}
-      </button>
+          <button className="botao botao--primario" onClick={aoColetar}>
+            Coleta manual
+          </button>
+        </>
+      )}
+
+      <MenuUsuario usuario={usuario} aoSair={aoSair} aoAvisar={aoAvisar} />
     </header>
   );
 }

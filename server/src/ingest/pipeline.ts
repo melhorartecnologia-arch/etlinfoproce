@@ -26,6 +26,8 @@ export interface OpcoesColeta {
   tentativa?: number;
   /** Reprocessa apenas estes arquivos (por nome). Vazio = a pasta inteira. */
   somenteArquivos?: string[];
+  /** Quem disparou, quando veio da tela. Nulo para o agendador. */
+  idUsuario?: number;
 }
 
 export interface ResultadoColeta {
@@ -109,6 +111,7 @@ export async function executarColeta(
     gatilho: opcoes.gatilho ?? 'agendador',
     tentativa: opcoes.tentativa ?? 1,
     fonte: config.coleta.fonte,
+    idUsuario: opcoes.idUsuario,
   });
 
   const inicio = Date.now();

@@ -30,9 +30,11 @@ function corRetencao(dias: number | null): string | undefined {
 }
 
 export function InventarioSftp({
+  podeOperar,
   aoAvisar,
   aoRecarregarStatus,
 }: {
+  podeOperar: boolean;
   aoAvisar: (texto: string, erro?: boolean) => void;
   aoRecarregarStatus: () => void;
 }) {
@@ -166,21 +168,27 @@ export function InventarioSftp({
                   </td>
                   <td>
                     <div className="acoes">
-                      <a
-                        className="botao botao--miudo"
-                        href={api.urlDownloadPasta(p.pasta)}
-                        target="_blank"
-                        rel="noreferrer"
-                        title="Baixa as cópias locais da pasta num único .tar"
-                      >
-                        Baixar
-                      </a>
-                      <button
-                        className="botao botao--miudo"
-                        onClick={() => reprocessar(p.pasta)}
-                      >
-                        Reprocessar
-                      </button>
+                      {podeOperar ? (
+                        <>
+                          <a
+                            className="botao botao--miudo"
+                            href={api.urlDownloadPasta(p.pasta)}
+                            target="_blank"
+                            rel="noreferrer"
+                            title="Baixa as cópias locais da pasta num único .tar"
+                          >
+                            Baixar
+                          </a>
+                          <button
+                            className="botao botao--miudo"
+                            onClick={() => reprocessar(p.pasta)}
+                          >
+                            Reprocessar
+                          </button>
+                        </>
+                      ) : (
+                        <span className="suave">—</span>
+                      )}
                     </div>
                   </td>
                 </tr>

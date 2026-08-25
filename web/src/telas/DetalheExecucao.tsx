@@ -23,11 +23,13 @@ import {
 
 export function DetalheExecucao({
   id,
+  podeOperar,
   aoVoltar,
   aoAvisar,
   aoRecarregarStatus,
 }: {
   id: number | null;
+  podeOperar: boolean;
   aoVoltar: () => void;
   aoAvisar: (texto: string, erro?: boolean) => void;
   aoRecarregarStatus: () => void;
@@ -104,9 +106,11 @@ export function DetalheExecucao({
             >
               Auditoria PDF
             </a>
-            <button className="botao botao--acento" onClick={reprocessar}>
-              Reprocessar run
-            </button>
+            {podeOperar && (
+              <button className="botao botao--acento" onClick={reprocessar}>
+                Reprocessar run
+              </button>
+            )}
           </>
         }
       />
@@ -236,6 +240,9 @@ export function DetalheExecucao({
                   </td>
                   <td>
                     <div className="acoes">
+                      {!podeOperar && <span className="suave">—</span>}
+                      {podeOperar && (
+                      <>
                       <a
                         className={`botao botao--miudo${a.temCopiaLocal ? '' : ' desabilitado'}`}
                         href={api.urlDownloadArquivo(a.id)}
@@ -256,6 +263,8 @@ export function DetalheExecucao({
                       >
                         Reprocessar
                       </button>
+                      </>
+                      )}
                     </div>
                   </td>
                 </tr>

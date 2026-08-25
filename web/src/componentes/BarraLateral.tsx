@@ -1,17 +1,19 @@
 import type { StatusResposta } from '@infoprice/shared';
 import type { Tela } from '../navegacao.js';
-import { GRUPOS_NAV } from '../navegacao.js';
+import { gruposPara } from '../navegacao.js';
 
 export function BarraLateral({
   tela,
   irPara,
   status,
   incidentesAbertos,
+  podeAdministrar,
 }: {
   tela: Tela;
   irPara: (t: Tela) => void;
   status: StatusResposta | null;
   incidentesAbertos: number;
+  podeAdministrar: boolean;
 }) {
   const conectado = status?.sftp.conectado ?? false;
 
@@ -23,7 +25,7 @@ export function BarraLateral({
       </div>
 
       <nav className="barra__nav">
-        {GRUPOS_NAV.map((grupo) => (
+        {gruposPara(podeAdministrar).map((grupo) => (
           <div className="barra__grupo" key={grupo.titulo}>
             <span className="barra__grupo-titulo">{grupo.titulo}</span>
             {grupo.itens.map((item) => {

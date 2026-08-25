@@ -29,16 +29,30 @@ import {
 import { executarColeta } from '../ingest/pipeline.js';
 import { SQL_PERSISTENCIA } from '../ingest/merge-incremental.js';
 import { resolverIncidente } from '../alertas/index.js';
+import {
+  exigirAutenticacao,
+  exigirOperador,
+} from '../auth/middleware.js';
 import { bytesBR, duracaoBR, numeroBR, percentualBR } from '../util/formato.js';
 import { dataLocal } from '../util/tempo.js';
 import * as q from './consultas.js';
 
 export const rotas = Router();
 
-/** Quem está operando. Numa instalação real viria da sessão autenticada. */
+/**
+ * Toda esta área exige sessão. Nada de dado operacional sai sem alguém
+ * identificado do outro lado — nem para leitura.
+ */
+rotas.use(exigirAutenticacao);
+
+/** Quem está operando, segundo a sessão. */
 function operador(req: Request): string {
-  const cabecalho = req.header('x-operador');
-  return cabecalho?.trim() || config.operadorPadrao;
+  return req.usuario!.login;
+}
+
+/** O id do usuário, para gravar autoria nas tabelas de controle. */
+function idOperador(req: Request): number {
+  return req.usuario!.id;
 }
 
 function inteiro(valor: unknown, padrao: number): number {
@@ -107,9 +121,10 @@ rotas.get(
 
 rotas.post(
   '/agendamento/pausar',
+  exigirOperador,
   rota(async (req, res) => {
     const quem = operador(req);
-    await pausarAgendamento(quem);
+    await pausarAgendamento(quem, idOperador(req));
     const r: AcaoResposta = {
       ok: true,
       mensagem: 'Agendamento pausado · nenhuma coleta automática será disparada',
@@ -120,6 +135,7 @@ rotas.post(
 
 rotas.post(
   '/agendamento/retomar',
+  exigirOperador,
   rota(async (_req, res) => {
     await retomarAgendamento();
     const proxima = await proximaExecucao();
@@ -365,15 +381,17 @@ rotas.get(
 
 rotas.post(
   '/execucoes',
+  exigirOperador,
   rota(async (req, res) => {
     const runDate = (req.body?.run as string) || dataLocal();
     const quem = operador(req);
 
     // A coleta roda em segundo plano: a tela recebe a confirmação na hora e
     // acompanha o progresso pelo painel.
-    comTrilho(() => coletaDiariaComTentativas(runDate, 'manual')).catch(
-      (erro) => console.error('[coleta manual]', erro.message),
-    );
+    const idUsuario = idOperador(req);
+    comTrilho(() =>
+      coletaDiariaComTentativas(runDate, 'manual', idUsuario),
+    ).catch((erro) => console.error('[coleta manual]', erro.message));
 
     const r: AcaoResposta = {
       ok: true,
@@ -385,6 +403,7 @@ rotas.post(
 
 rotas.post(
   '/execucoes/:id/reprocessar',
+  exigirOperador,
   rota(async (req, res) => {
     const id = Number(req.params.id);
     const execucao = await q.buscarExecucao(id);
@@ -528,6 +547,7 @@ rotas.get(
 
 rotas.post(
   '/inventario/:pasta/reprocessar',
+  exigirOperador,
   rota(async (req, res) => {
     const pasta = req.params.pasta;
     const m = /^run=(\d{4}-\d{2}-\d{2})$/.exec(pasta);
@@ -561,6 +581,7 @@ rotas.post(
  */
 rotas.get(
   '/inventario/:pasta/download',
+  exigirOperador,
   rota(async (req, res) => {
     const pasta = req.params.pasta;
     if (!/^run=\d{4}-\d{2}-\d{2}$/.test(pasta)) {
@@ -624,6 +645,7 @@ rotas.get(
 
 rotas.post(
   '/varredura',
+  exigirOperador,
   rota(async (_req, res) => {
     varredura().catch((erro) => console.error('[varredura]', erro.message));
     const r: AcaoResposta = {
@@ -638,6 +660,7 @@ rotas.post(
 
 rotas.post(
   '/arquivos/:id/reprocessar',
+  exigirOperador,
   rota(async (req, res) => {
     const arquivo = await q.buscarArquivo(Number(req.params.id));
     if (!arquivo) {
@@ -665,6 +688,7 @@ rotas.post(
 /** Baixa a cópia local do arquivo bruto, exatamente como veio da origem. */
 rotas.get(
   '/arquivos/:id/download',
+  exigirOperador,
   rota(async (req, res) => {
     const arquivo = await q.buscarArquivo(Number(req.params.id));
     if (!arquivo) {
@@ -756,10 +780,11 @@ rotas.get(
 
 rotas.post(
   '/incidentes/:codigo/resolver',
+  exigirOperador,
   rota(async (req, res) => {
     const quem = operador(req);
     const codigo = decodeURIComponent(req.params.codigo);
-    const ok = await resolverIncidente(codigo, quem);
+    const ok = await resolverIncidente(codigo, quem, idOperador(req));
 
     if (!ok) {
       res.status(404).json({ erro: 'incidente não encontrado ou já resolvido' });

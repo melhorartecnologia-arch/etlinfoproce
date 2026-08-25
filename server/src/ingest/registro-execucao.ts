@@ -23,13 +23,14 @@ export class RegistroExecucao {
     gatilho?: string;
     tentativa?: number;
     fonte?: string;
+    idUsuario?: number;
   }): Promise<RegistroExecucao> {
     const assinatura = crypto.randomBytes(4).toString('hex');
 
     const linha = await consultarUm<{ id: number }>(
       `INSERT INTO infoprice.ctl_execucao
-         (run_date, tipo, gatilho, assinatura, fonte, tentativa, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'em_execucao')
+         (run_date, tipo, gatilho, assinatura, fonte, tentativa, status, id_usuario)
+       VALUES ($1, $2, $3, $4, $5, $6, 'em_execucao', $7)
        RETURNING id`,
       [
         opcoes.runDate,
@@ -38,6 +39,7 @@ export class RegistroExecucao {
         assinatura,
         opcoes.fonte ?? 'ISA-InfoPanel',
         opcoes.tentativa ?? 1,
+        opcoes.idUsuario ?? null,
       ],
     );
 

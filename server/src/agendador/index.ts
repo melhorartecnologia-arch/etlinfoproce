@@ -51,6 +51,7 @@ async function estaPausado(): Promise<boolean> {
 export async function coletaDiariaComTentativas(
   runDate = dataLocal(),
   gatilho: 'agendador' | 'manual' | 'varredura' = 'agendador',
+  idUsuario?: number,
 ): Promise<void> {
   const maximo = Math.max(1, config.agendamento.tentativas);
 
@@ -59,6 +60,7 @@ export async function coletaDiariaComTentativas(
       runDate,
       gatilho: tentativa === 1 ? gatilho : 'retentativa',
       tentativa,
+      idUsuario,
     });
 
     if (resultado.status !== 'falha') return;
@@ -157,19 +159,28 @@ export async function proximaExecucao(): Promise<string | null> {
   }
 }
 
-export async function pausarAgendamento(quem: string): Promise<void> {
+export async function pausarAgendamento(
+  quem: string,
+  idUsuario?: number,
+): Promise<void> {
   await pool.query(
     `UPDATE infoprice.ctl_agendamento
-        SET pausado = true, pausado_em = now(), pausado_por = $1
+        SET pausado = true,
+            pausado_em = now(),
+            pausado_por = $1,
+            id_usuario_pausa = $2
       WHERE id = 1`,
-    [quem],
+    [quem, idUsuario ?? null],
   );
 }
 
 export async function retomarAgendamento(): Promise<void> {
   await pool.query(
     `UPDATE infoprice.ctl_agendamento
-        SET pausado = false, pausado_em = NULL, pausado_por = NULL
+        SET pausado = false,
+            pausado_em = NULL,
+            pausado_por = NULL,
+            id_usuario_pausa = NULL
       WHERE id = 1`,
   );
 }

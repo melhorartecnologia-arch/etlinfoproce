@@ -42,7 +42,20 @@ export const config = {
   raizServidor,
   porta: numero('PORT', 3001),
   ambiente: texto('NODE_ENV', 'development'),
-  operadorPadrao: texto('OPERADOR_PADRAO', 'operador'),
+  /** Origens autorizadas quando o console é servido de outro host. */
+  origensPermitidas: lista('ORIGENS_PERMITIDAS', ''),
+
+  auth: {
+    duracaoSessaoHoras: numero('SESSAO_DURACAO_HORAS', 12),
+    maxTentativas: numero('LOGIN_MAX_TENTATIVAS', 5),
+    janelaTentativasMin: numero('LOGIN_JANELA_MIN', 15),
+    /**
+     * Marca o cookie como Secure. Ligue em produção, onde o console fica atrás
+     * de HTTPS; em desenvolvimento (http://localhost) o cookie Secure não é
+     * aceito pelo navegador.
+     */
+    cookieSeguro: booleano('COOKIE_SEGURO', texto('NODE_ENV', '') === 'production'),
+  },
 
   banco: {
     host: texto('PGHOST', '127.0.0.1'),

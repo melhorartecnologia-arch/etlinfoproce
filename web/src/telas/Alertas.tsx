@@ -12,9 +12,11 @@ import {
 import { dataHoraBR, duracaoBR, tomDaSeveridade } from '../util.js';
 
 export function Alertas({
+  podeOperar,
   aoAvisar,
   aoRecarregarStatus,
 }: {
+  podeOperar: boolean;
   aoAvisar: (texto: string, erro?: boolean) => void;
   aoRecarregarStatus: () => void;
 }) {
@@ -96,12 +98,14 @@ export function Alertas({
                       : `Resolvido ${dataHoraBR(i.resolvidoEm)}`}
                   </span>
                   {aberto ? (
-                    <button
-                      className="botao botao--miudo"
-                      onClick={() => resolver(i.codigo)}
-                    >
-                      Marcar como resolvido
-                    </button>
+                    podeOperar && (
+                      <button
+                        className="botao botao--miudo"
+                        onClick={() => resolver(i.codigo)}
+                      >
+                        Marcar como resolvido
+                      </button>
+                    )
                   ) : (
                     i.duracaoMs !== null && (
                       <span
