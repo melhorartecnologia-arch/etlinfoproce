@@ -1,0 +1,24 @@
+{
+  "name": "console-ingestao-infoprice",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Console de ingestão diária de pesquisa de preços InfoPrice: coleta SFTP, persistência em PostgreSQL e rastreabilidade ponta a ponta.",
+  "workspaces": [
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace server & npm run dev --workspace web",
+    "dev:server": "npm run dev --workspace server",
+    "dev:web": "npm run dev --workspace web",
+    "build": "npm run build --workspace server && npm run build --workspace web",
+    "typecheck": "npm run typecheck --workspace server && npm run typecheck --workspace web",
+    "migrate": "npm run migrate --workspace server",
+    "seed": "npm run seed --workspace server",
+    "ingest": "npm run ingest --workspace server"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

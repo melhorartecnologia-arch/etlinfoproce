@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+*.pem
+var/
+server/var/
+web/dist/
+*.tsbuildinfo
+.DS_Store
