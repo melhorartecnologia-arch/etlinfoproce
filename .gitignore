@@ -9,3 +9,10 @@ server/var/
 web/dist/
 *.tsbuildinfo
 .DS_Store
+
+# Bundle de design do Claude Design, mantido fora deste repositório de
+# propósito: project/uploads/ contém um print de conversa com a senha do SFTP
+# em texto puro, e este repositório é público. O bundle segue versionado no
+# clone local, no commit de handoff.
+project/
+chats/
