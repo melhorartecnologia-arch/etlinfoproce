@@ -317,6 +317,11 @@ run, então uma tentativa que falha três vezes abre um incidente, não três.
 Só uma coleta roda por vez; uma segunda tentativa recebe `409` com a mensagem
 que a tela mostra no toast.
 
+## Publicar em servidor
+
+Para instalar no Lightsail (Ubuntu) com PM2, Nginx e SSL do Let's Encrypt, veja
+o passo a passo em [DEPLOY.md](DEPLOY.md).
+
 ## Verificação
 
 ```bash
