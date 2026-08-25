@@ -3,6 +3,11 @@ dist/
 .env
 .env.local
 *.log
+
+# Nenhum PEM no repositório. Cobre a chave privada do SFTP e também o bundle de
+# CAs do RDS — este último é público, mas a AWS rotaciona as autoridades, e um
+# bundle versionado envelhece sem ninguém notar até a conexão parar. Provisione
+# no deploy: npm run baixar-ca-rds --workspace @infoprice/server
 *.pem
 var/
 server/var/

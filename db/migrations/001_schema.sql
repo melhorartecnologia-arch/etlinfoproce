@@ -9,7 +9,25 @@
 
 CREATE SCHEMA IF NOT EXISTS infoprice;
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- gen_random_uuid() é nativo desde o PostgreSQL 13, que é o piso das versões
+-- disponíveis no RDS. Em bases mais antigas ele vem do pgcrypto — tentamos
+-- criar a extensão, mas sem abortar se o usuário não tiver permissão: no RDS o
+-- usuário mestre não é superusuário, e num PostgreSQL 13+ a extensão é
+-- dispensável de qualquer forma.
+DO $$
+BEGIN
+  IF current_setting('server_version_num')::integer < 130000 THEN
+    BEGIN
+      CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    EXCEPTION WHEN insufficient_privilege THEN
+      RAISE EXCEPTION
+        'PostgreSQL % exige a extensão pgcrypto para gen_random_uuid(), e este '
+        'usuário não pode criá-la. Peça a um administrador: CREATE EXTENSION pgcrypto;',
+        current_setting('server_version');
+    END;
+  END IF;
+END
+$$;
 
 -- ── Execuções ───────────────────────────────────────────────────────────────
 

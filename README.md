@@ -154,6 +154,111 @@ A chave `.pem` **não** é versionada (`.gitignore` cobre `*.pem`). A senha do F
 nunca aparece na tela: a aplicação recebe apenas a referência do cofre, e é isso
 que a tela de configuração mostra.
 
+## Deploy contra o PostgreSQL do Amazon RDS
+
+Aponte `PGHOST` para o **endpoint do writer** — a aplicação escreve, e com
+Multi-AZ esse endpoint acompanha a instância ativa depois de um failover.
+
+### TLS
+
+```env
+PGHOST=infoprice.abc123.sa-east-1.rds.amazonaws.com
+PGSSLMODE=verify-full
+CA_RDS=./certs/rds-global-bundle.pem
+```
+
+```bash
+npm run baixar-ca-rds --workspace @infoprice/server
+```
+
+`verify-full` é o padrão automático quando `PGHOST` termina em
+`.rds.amazonaws.com`. Ele confere o certificado contra as CAs da AWS **e** o
+hostname — é o que separa "a conexão está cifrada" de "a conexão está cifrada
+com quem eu penso que é". `require` cifra sem verificar e protege apenas de
+escuta passiva; existe como saída para quem não consegue provisionar o bundle,
+e o servidor avisa no log quando está nesse modo.
+
+No RDS, ligue também `rds.force_ssl=1` no parameter group: aí o próprio banco
+recusa conexão em texto claro, independentemente do que a aplicação peça.
+
+Para conferir antes de subir:
+
+```bash
+npm run testar-conexao --workspace @infoprice/server
+```
+
+Ele responde se a conexão está cifrada **de fato** (lendo `pg_stat_ssl`), e sai
+com erro se o banco for remoto e o tráfego estiver em texto claro.
+
+### Credenciais
+
+| `PG_CREDENCIAL` | Como funciona |
+|---|---|
+| `env` | senha em `PGPASSWORD` |
+| `secrets-manager` | senha lida de um segredo, via `PG_SEGREDO_ARN` |
+| `iam` | token IAM de 15 min, gerado a cada conexão — sem senha fixa |
+
+`iam` é o mais robusto: não existe segredo de longa duração para vazar, e
+revogar acesso é tirar a permissão no IAM. Exige `GRANT rds_iam TO <usuario>` no
+banco e a ação `rds-db:connect` no papel da aplicação. Os dois modos da AWS
+usam pacotes opcionais, instalados só se você escolher usá-los:
+
+```bash
+npm i @aws-sdk/rds-signer --workspace @infoprice/server              # iam
+npm i @aws-sdk/client-secrets-manager --workspace @infoprice/server  # secrets-manager
+```
+
+O usuário (`PGUSER`) vem sempre do ambiente: nome de login não é segredo.
+
+### Tempos e failover
+
+O pool usa `keepAlive`, para detectar o socket morto que sobra depois de um
+failover Multi-AZ em vez de descobri-lo só na próxima consulta. Erros em
+conexões ociosas são tratados e registrados: o driver descarta a conexão
+quebrada e abre outra sozinho.
+
+`statement_timeout` vale 30 s para as consultas de tela. A transação da
+ingestão — COPY, regras de qualidade e merge — levanta o próprio teto para
+`PG_TIMEOUT_INGESTAO_MS` (1 h por padrão), porque ela passa bem disso com
+volume real. `idle_in_transaction_session_timeout` derruba a sessão que ficar
+parada dentro de uma transação, para que um processo travado não segure locks
+no RDS até alguém notar.
+
+### Migrações
+
+Rodam na subida, protegidas por um advisory lock: várias tarefas do serviço
+subindo ao mesmo tempo não aplicam o mesmo arquivo em paralelo — uma aplica, as
+outras esperam e seguem. As migrações rodam sem `statement_timeout`, já que
+criar índice em tabela grande passa dos 30 s.
+
+O schema não exige superusuário. `gen_random_uuid()` é nativo do PostgreSQL 13+,
+que é o piso das versões do RDS, então `pgcrypto` não é necessário — o usuário
+mestre do RDS não é superusuário e não poderia criá-lo.
+
+### Rede
+
+A instância deve ficar em subnet privada, sem acesso público, e o security
+group do RDS deve liberar a porta 5432 **apenas** para o security group da
+aplicação — não para um bloco CIDR aberto.
+
+### Atenção: disco efêmero
+
+A área de spool (`AREA_TEMPORARIA`) guarda as cópias locais dos arquivos
+baixados, e é dela que saem o "Baixar bruto" e o download da pasta em `.tar`.
+Se a aplicação rodar em contêiner (ECS/Fargate), esse disco morre a cada
+implantação, e a retenção de 30 dias prometida pela tela não se sustenta —
+o botão passa a responder "cópia local indisponível" para tudo que veio antes
+do último deploy.
+
+Escolha um destes antes de ir a produção:
+
+- **EFS** montado em `AREA_TEMPORARIA` — mantém o código como está;
+- **S3** como área de arquivo, trocando a leitura do disco local por um objeto
+  versionado (muda `ctl_arquivo.caminho_local` e as duas rotas de download);
+- **aceitar a perda**, reduzindo `RETENCAO_LOCAL_DIAS` e deixando claro na tela
+  que o arquivo bruto só existe enquanto a origem o mantiver (5 dias).
+
+
 ## Agendamento
 
 | Rotina | Padrão | Configuração |

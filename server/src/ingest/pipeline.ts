@@ -309,6 +309,8 @@ async function rodarEtapas(
   let divergencias: string[] = [];
 
   // ── 6 a 9 · staging → qualidade → merge → watermark, em uma transação ─────
+  // `longa`: esta transação abriga o COPY, as regras de qualidade e o merge,
+  // que passam bem do teto de 30s aplicado às consultas de tela.
   const totais = await emTransacao(async (cliente) => {
     // 5 · validação de schema + 6 · carga em staging
     await registro.iniciarEtapa('Validação de schema');
@@ -467,7 +469,7 @@ async function rodarEtapas(
       watermarkAnterior,
       arquivosIngeridos: porArquivo.length,
     };
-  });
+  }, { longa: true });
 
   const percentual =
     totais.linhasStaging > 0

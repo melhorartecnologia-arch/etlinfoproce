@@ -13,7 +13,9 @@
     "ingest": "tsx src/scripts/ingest.ts",
     "usuario": "tsx src/scripts/usuario.ts",
     "gerar-fixtures": "tsx src/scripts/gerar-fixtures.ts",
-    "baixar-fontes": "tsx src/scripts/baixar-fontes.ts"
+    "baixar-fontes": "tsx src/scripts/baixar-fontes.ts",
+    "baixar-ca-rds": "tsx src/scripts/baixar-ca-rds.ts",
+    "testar-conexao": "tsx src/scripts/testar-conexao.ts"
   },
   "dependencies": {
     "@infoprice/shared": "*",

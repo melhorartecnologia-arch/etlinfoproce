@@ -1,7 +1,8 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import cors from 'cors';
 import { config } from './config.js';
-import { pool, fecharPool } from './db/pool.js';
+import { pool, fecharPool, estadoPool } from './db/pool.js';
+import { descreverTls } from './db/tls.js';
 import { migrar } from './db/migrate.js';
 import { iniciarAgendador, pararAgendador } from './agendador/index.js';
 import { rotas } from './api/rotas.js';
@@ -29,15 +30,38 @@ app.use(express.json({ limit: '1mb' }));
 // bloqueio por tentativas contaria todo mundo como o mesmo endereço.
 app.set('trust proxy', true);
 
+/**
+ * Health check para o balanceador e para o diagnóstico do deploy.
+ *
+ * Reporta se a conexão está cifrada de fato, e não só se o banco respondeu:
+ * um deploy que caiu para texto claro contra o RDS é exatamente o tipo de erro
+ * que passa despercebido porque a aplicação continua funcionando.
+ */
 app.get('/api/saude', async (_req, res) => {
+  const inicio = Date.now();
   try {
-    await pool.query('SELECT 1');
-    res.json({ ok: true, banco: 'conectado' });
+    const r = await pool.query<{ cifrada: boolean | null; versao: string }>(
+      `SELECT (SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) AS cifrada,
+              current_setting('server_version') AS versao`,
+    );
+
+    res.json({
+      ok: true,
+      banco: 'conectado',
+      versao: r.rows[0]?.versao,
+      tls: {
+        configurado: descreverTls(),
+        conexaoCifrada: r.rows[0]?.cifrada ?? false,
+      },
+      pool: estadoPool(),
+      latenciaMs: Date.now() - inicio,
+    });
   } catch (erro) {
     res.status(503).json({
       ok: false,
       banco: 'indisponível',
       detalhe: erro instanceof Error ? erro.message : String(erro),
+      latenciaMs: Date.now() - inicio,
     });
   }
 });
@@ -103,7 +127,10 @@ async function iniciar(): Promise<void> {
   const servidor = app.listen(config.porta, () => {
     console.log(
       `[main] console de ingestão em http://localhost:${config.porta}/api ` +
-        `· origem ${config.sftp.driver} · banco ${config.banco.banco}`,
+        `· origem ${config.sftp.driver} ` +
+        `· banco ${config.banco.banco}@${config.banco.host} ` +
+        `· ${descreverTls()} ` +
+        `· credencial ${config.banco.credencial}`,
     );
   });
 

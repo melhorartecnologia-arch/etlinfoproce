@@ -66,6 +66,61 @@ export const config = {
     schema: texto('PGSCHEMA', 'infoprice'),
     instanciaRotulo: texto('INSTANCIA_ROTULO', 'postgres.interno:5432'),
     maxConexoes: numero('PGPOOL_MAX', 10),
+
+    /**
+     * Modo de TLS.
+     *
+     *   verify-full  cifra e confere o certificado contra a CA da AWS e o
+     *                hostname. É o correto para RDS, e o padrão quando o host
+     *                termina em .rds.amazonaws.com.
+     *   require      cifra mas não confere o certificado. Protege contra
+     *                escuta passiva, não contra interceptação ativa. Só use se
+     *                não houver como provisionar o bundle de CA.
+     *   disable      sem TLS. Aceitável apenas para PostgreSQL local.
+     */
+    sslModo: texto(
+      'PGSSLMODE',
+      /\.rds\.amazonaws\.com$/i.test(texto('PGHOST', ''))
+        ? 'verify-full'
+        : 'disable',
+    ) as 'verify-full' | 'require' | 'disable',
+
+    /** Bundle de CAs do RDS. Baixe com `npm run baixar-ca-rds`. */
+    caRds: caminho('CA_RDS', './certs/rds-global-bundle.pem'),
+
+    /**
+     * De onde vem a senha:
+     *   env             PGPASSWORD (simples, mas a senha fica no ambiente)
+     *   secrets-manager segredo do AWS Secrets Manager, com rotação
+     *   iam             token do IAM, válido por 15 min e renovado a cada
+     *                   conexão; não existe senha para vazar
+     */
+    credencial: texto('PG_CREDENCIAL', 'env') as
+      | 'env'
+      | 'secrets-manager'
+      | 'iam',
+    /** ARN ou nome do segredo, quando credencial=secrets-manager. */
+    segredoArn: texto('PG_SEGREDO_ARN', ''),
+    regiaoAws: texto('AWS_REGION', 'sa-east-1'),
+
+    // ── Tempos, calibrados para um salto de rede até o RDS ─────────────────
+    /** Espera por uma conexão livre no pool. */
+    timeoutConexaoMs: numero('PG_TIMEOUT_CONEXAO_MS', 10_000),
+    /** Fecha conexões ociosas antes que o RDS ou um NAT as derrube. */
+    timeoutOciosaMs: numero('PG_TIMEOUT_OCIOSA_MS', 30_000),
+    /**
+     * Teto para uma consulta comum. O merge da ingestão é exceção e ajusta o
+     * próprio limite na transação — ver PG_TIMEOUT_INGESTAO_MS.
+     */
+    timeoutConsultaMs: numero('PG_TIMEOUT_CONSULTA_MS', 30_000),
+    /** Teto para as etapas pesadas: COPY, regras de qualidade e merge. */
+    timeoutIngestaoMs: numero('PG_TIMEOUT_INGESTAO_MS', 3_600_000),
+    /**
+     * Derruba a sessão que ficar parada dentro de uma transação. Sem isto, um
+     * processo travado no meio da ingestão seguraria locks no RDS até alguém
+     * notar.
+     */
+    timeoutTransacaoOciosaMs: numero('PG_TIMEOUT_TRANSACAO_OCIOSA_MS', 120_000),
   },
 
   sftp: {
