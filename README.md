@@ -111,8 +111,12 @@ dona da rejeição, então uma linha nunca aparece com dois motivos.
 2. GTIN inválido no dígito verificador (módulo 10 GS1, em `infoprice.gtin_valido`)
 3. Preço menor ou igual a zero
 4. Preço acima do limite (o fato guarda `numeric(12,2)`; maior que isso estouraria o merge)
-5. Loja ausente em `dim_loja`
-6. Data de coleta fora da janela do run
+5. Loja ausente em `dim_loja` — com `CADASTRAR_LOJAS` ligado (o padrão), as
+   lojas do arquivo são cadastradas antes das regras, com a rede, a UF e a
+   cidade que ele informa, e a regra só pega a linha sem loja
+6. Data de coleta fora da janela — posterior ao run, ou mais antiga que
+   `JANELA_COLETA_DIAS` (365 por padrão: o arquivo traz o último preço visto
+   em cada loja, que pode ter meses)
 7. Duplicidade na chave de conflito, dentro do arquivo — mantém a última
    ocorrência. A mesma chave em outro arquivo do run vira atualização no merge
    do arquivo seguinte.
@@ -129,9 +133,25 @@ na regra 1. O log da execução conta as linhas de cada caso, por arquivo.
 
 ### Layout do arquivo
 
+O layout da InfoPrice (ISA-InfoPanel) é reconhecido sem configuração: 44
+colunas separadas por `|`, nulo gravado como `\N` (padrão do Spark).
+
+| Coluna interna | Vem de |
+|---|---|
+| `data_coleta` | `data_preco` |
+| `id_loja` | `loja` (ou `id_loja`, quando `loja` vier vazia) |
+| `municipio` | `cidade` |
+| `preco` | `preco_regular` (ou `preco_pago`, quando o regular vier vazio) |
+| `preco_promocional` | `preco_pago`, quando `flag_promocao` = true |
+| `tipo_preco` | `Promoção` ou `Regular`, a partir de `flag_promocao` |
+| `gtin`, `descricao`, `rede`, `uf` | colunas de mesmo nome |
+
+As demais colunas seguem preservadas no payload de cada linha. Quando duas
+colunas do arquivo caem no mesmo nome interno, vale o primeiro valor não vazio.
+
 As colunas obrigatórias são `gtin`, `descricao`, `id_loja`, `preco` e
-`data_coleta`; alguns nomes alternativos comuns (`ean`, `produto`,
-`codigo_loja`, `valor`, `dt_coleta`…) já são reconhecidos. Para ver como um
+`data_coleta`; outros nomes alternativos comuns (`ean`, `produto`,
+`codigo_loja`, `valor`, `dt_coleta`…) também são reconhecidos. Para ver como um
 arquivo é interpretado — delimitador, cada coluna e para qual nome interno ela
 foi mapeada, o que falta:
 
@@ -178,7 +198,7 @@ npm run gerar-fixtures --workspace @infoprice/server -- --dias 6 --arquivos 4 --
 npm run ingest --workspace @infoprice/server -- --run 2026-08-25
 ```
 
-O gerador semeia defeitos de propósito (~0,32% das linhas, abaixo do limite de
+O gerador produz o layout real da InfoPrice e semeia defeitos de propósito (~0,32% das linhas, abaixo do limite de
 0,5% que abre incidente), um por regra de qualidade, para a tela de rejeições
 ter o que mostrar — e também aspas escapadas com barra, que devem ser aceitas. `--semente 7` regera o mesmo dia com outros preços, o que
 demonstra o caminho de atualização do merge.

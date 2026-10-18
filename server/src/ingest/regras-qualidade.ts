@@ -1,3 +1,4 @@
+import { config } from '../config.js';
 import type { Cliente } from '../db/pool.js';
 
 /**
@@ -53,11 +54,12 @@ const REGRAS: Regra[] = [
   {
     motivo: 'Data de coleta fora da janela do run',
     tratamento: 'Reenfileirada para run correto',
-    // A coleta do dia pode trazer preços apurados na véspera; qualquer coisa
-    // fora dessa janela de dois dias é erro de origem.
+    // O arquivo traz o último preço visto em cada loja, que pode ter meses:
+    // vale até JANELA_COLETA_DIAS antes do run. Data no futuro é erro de origem.
     condicao: `infoprice.para_data(s.data_coleta) IS NULL
                OR infoprice.para_data(s.data_coleta) > s.run_date
-               OR infoprice.para_data(s.data_coleta) < s.run_date - INTERVAL '1 day'`,
+               OR infoprice.para_data(s.data_coleta)
+                    < s.run_date - ${Math.max(0, Math.trunc(config.coleta.janelaColetaDias))}`,
   },
   {
     motivo: 'Caractere inválido na descrição',
@@ -79,6 +81,36 @@ const REGRA_DUPLICIDADE = {
   motivo: 'Duplicidade na chave de conflito',
   tratamento: 'Última ocorrência mantida',
 };
+
+/**
+ * Cadastra em dim_loja as lojas do arquivo que ainda não estão lá, com a rede,
+ * a UF e a cidade que o próprio arquivo informa. Roda antes das regras, para
+ * que "Loja ausente em dim_loja" só pegue a linha sem loja.
+ */
+export async function cadastrarLojasNovas(
+  cliente: Cliente,
+  idExecucao: number,
+  idArquivo: number,
+): Promise<number> {
+  const { rowCount } = await cliente.query(
+    `INSERT INTO infoprice.dim_loja (id_loja, rede, nome, uf, cidade)
+     SELECT DISTINCT ON (s.id_loja)
+            s.id_loja,
+            NULLIF(btrim(s.rede), ''),
+            s.id_loja,
+            NULLIF(btrim(s.uf), ''),
+            NULLIF(btrim(s.municipio), '')
+       FROM infoprice.stg_isa_infopanel_preco s
+      WHERE s.id_execucao = $1
+        AND s.id_arquivo = $2
+        AND s.erro_leitura IS NULL
+        AND btrim(coalesce(s.id_loja, '')) <> ''
+      ORDER BY s.id_loja
+     ON CONFLICT (id_loja) DO NOTHING`,
+    [idExecucao, idArquivo],
+  );
+  return rowCount ?? 0;
+}
 
 export interface ContagemMotivo {
   motivo: string;

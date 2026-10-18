@@ -148,7 +148,19 @@ export const config = {
     paralelismo: numero('DOWNLOAD_PARALELISMO', 4),
     retencaoOrigemDias: numero('RETENCAO_ORIGEM_DIAS', 5),
     retencaoLocalDias: numero('RETENCAO_LOCAL_DIAS', 30),
-    colunasEsperadas: numero('COLUNAS_ESPERADAS', 42),
+    colunasEsperadas: numero('COLUNAS_ESPERADAS', 44),
+    /**
+     * Quantos dias antes do run a data do preço ainda é aceita. O arquivo da
+     * InfoPrice traz o último preço visto de cada produto em cada loja, e essa
+     * data pode ser de meses atrás. Data posterior ao run é sempre rejeitada.
+     */
+    janelaColetaDias: numero('JANELA_COLETA_DIAS', 365),
+    /**
+     * Cadastra em dim_loja as lojas que aparecem no arquivo. O arquivo traz
+     * rede, UF e cidade de cada loja; sem isto, a regra "Loja ausente em
+     * dim_loja" rejeitaria toda loja ainda não cadastrada à mão.
+     */
+    cadastrarLojas: booleano('CADASTRAR_LOJAS', true),
     /**
      * Nomes de coluna do arquivo que diferem dos usados aqui, no formato
      * "coluna_interna=nome_no_arquivo" separados por vírgula

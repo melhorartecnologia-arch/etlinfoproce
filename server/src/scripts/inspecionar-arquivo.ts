@@ -14,7 +14,9 @@ import { config } from '../config.js';
 import {
   COLUNAS_OBRIGATORIAS,
   analisarCabecalho,
+  lerCsv,
   primeirasLinhas,
+  type LinhaLida,
   validarCabecalho,
 } from '../ingest/leitor-csv.js';
 
@@ -70,6 +72,24 @@ async function main(): Promise<void> {
 
   console.log('\nprimeiras linhas como vieram:');
   for (const l of linhas) console.log(`  ${l.slice(0, 300)}`);
+
+  // Como as duas primeiras linhas de dado chegam ao staging, já com nulos,
+  // sinônimos e campos derivados (preço, promoção) aplicados.
+  const PARAR = new Error('parar');
+  let amostra: LinhaLida[] = [];
+  await lerCsv(alvo, async (lote) => {
+    amostra = lote;
+    throw PARAR;
+  }, 2).catch((erro) => {
+    if (erro !== PARAR) throw erro;
+  });
+  const exibir = ['gtin', 'descricao', 'id_loja', 'rede', 'uf', 'municipio',
+    'preco', 'preco_promocional', 'tipo_preco', 'data_coleta'];
+  for (const l of amostra) {
+    console.log(`\nlinha ${l.numeroLinha} como vai para o staging:`);
+    if (l.erro) console.log(`  ✗ ${l.erro}`);
+    else for (const c of exibir) console.log(`  ${c.padEnd(18)} ${l.campos[c] || '—'}`);
+  }
 
   const problema = validarCabecalho(info);
   console.log(

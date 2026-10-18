@@ -1,18 +1,20 @@
 /**
  * Popula dim_loja — a dimensão que a regra "Loja ausente em dim_loja" consulta.
+ * Opcional: com CADASTRAR_LOJAS ligado (o padrão), a ingestão cadastra sozinha
+ * as lojas que aparecem nos arquivos.
  *
  * Uso: npm run seed --workspace server
  */
 import { pool, fecharPool } from '../db/pool.js';
 
 const LOJAS = [
-  ['SP-8841', '1042', 'Hipermercado Zona Sul', 'SP', 'São Paulo'],
-  ['SP-1027', '388', 'Supermercado Central', 'SP', 'Campinas'],
-  ['SP-3390', '1042', 'Hipermercado ABC', 'SP', 'Santo André'],
-  ['SP-4415', '705', 'Atacado Guarulhos', 'SP', 'Guarulhos'],
-  ['RJ-1120', '388', 'Supermercado Tijuca', 'RJ', 'Rio de Janeiro'],
-  ['MG-2204', '705', 'Atacado Savassi', 'MG', 'Belo Horizonte'],
-  ['RS-9017', '1042', 'Hipermercado Moinhos', 'RS', 'Porto Alegre'],
+  ['STOK_CENTER-5111625', 'STOK CENTER', 'STOK_CENTER-5111625', 'RS', 'TORRES'],
+  ['SUPER MUFFATO-440736', 'SUPER MUFFATO', 'SUPER MUFFATO-440736', 'PR', 'PARANAVAÍ'],
+  ['PAO_DE_ACUCAR-1042', 'PÃO DE AÇÚCAR', 'PAO_DE_ACUCAR-1042', 'SP', 'SÃO PAULO'],
+  ['ASSAI-388', 'ASSAÍ', 'ASSAI-388', 'SP', 'CAMPINAS'],
+  ['GUANABARA-1120', 'GUANABARA', 'GUANABARA-1120', 'RJ', 'RIO DE JANEIRO'],
+  ['BH-2204', 'SUPERMERCADOS BH', 'BH-2204', 'MG', 'BELO HORIZONTE'],
+  ['ZAFFARI-9017', 'ZAFFARI', 'ZAFFARI-9017', 'RS', 'PORTO ALEGRE'],
 ];
 
 async function main(): Promise<void> {

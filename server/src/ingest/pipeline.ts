@@ -18,6 +18,7 @@ import {
 import { mergeIncremental } from './merge-incremental.js';
 import {
   aplicarRegrasQualidade,
+  cadastrarLojasNovas,
   type ContagemMotivo,
 } from './regras-qualidade.js';
 import { RegistroExecucao } from './registro-execucao.js';
@@ -382,6 +383,7 @@ async function rodarEtapas(
     inseridas: 0,
     atualizadas: 0,
     comErro: 0,
+    lojasNovas: 0,
   };
   const porMotivo = new Map<string, number>();
 
@@ -396,6 +398,7 @@ async function rodarEtapas(
       totais.rejeitadas += r.rejeitadas;
       totais.inseridas += r.inseridas;
       totais.atualizadas += r.atualizadas;
+      totais.lojasNovas += r.lojasNovas;
       for (const c of r.contagens) {
         porMotivo.set(c.motivo, (porMotivo.get(c.motivo) ?? 0) + c.quantidade);
       }
@@ -453,6 +456,11 @@ async function rodarEtapas(
   if (totais.rejeitadas > 0) {
     await registro.warn(
       `${numeroBR(totais.rejeitadas)} linhas reprovadas nas regras de qualidade · gravadas em ctl_rejeicao`,
+    );
+  }
+  if (totais.lojasNovas > 0) {
+    await registro.info(
+      `${numeroBR(totais.lojasNovas)} lojas novas cadastradas em dim_loja a partir dos arquivos`,
     );
   }
 
@@ -543,6 +551,7 @@ interface ResultadoArquivo {
   atualizadas: number;
   recuperadas: number;
   malformadas: number;
+  lojasNovas: number;
   contagens: ContagemMotivo[];
 }
 
@@ -577,6 +586,10 @@ async function processarArquivo(
     if (faltando.length > 0) {
       throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
     }
+
+    const lojasNovas = config.coleta.cadastrarLojas
+      ? await cadastrarLojasNovas(cliente, registro.id, arquivo.idArquivo)
+      : 0;
 
     const contagens = await aplicarRegrasQualidade(
       cliente,
@@ -625,6 +638,7 @@ async function processarArquivo(
       atualizadas: merge.atualizadas,
       recuperadas: carga.recuperadas,
       malformadas: carga.malformadas,
+      lojasNovas,
       contagens,
     };
   }, { longa: true });

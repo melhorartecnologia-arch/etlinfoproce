@@ -46,18 +46,23 @@ function lerOpcoes(): Opcoes {
   };
 }
 
-/** As 42 colunas do arquivo da InfoPrice. */
+/** As 44 colunas do arquivo da InfoPrice (ISA-InfoPanel), na ordem. */
 const CABECALHO = [
-  'gtin', 'descricao', 'id_loja', 'rede', 'uf', 'municipio',
-  'preco', 'preco_promocional', 'tipo_preco', 'data_coleta',
-  'id_pesquisa', 'id_produto', 'categoria', 'subcategoria', 'marca',
-  'fabricante', 'embalagem', 'quantidade', 'unidade_medida', 'ncm',
-  'cest', 'origem_coleta', 'canal', 'tipo_loja', 'cnpj_loja',
-  'endereco_loja', 'bairro', 'cep', 'latitude', 'longitude',
-  'regiao', 'cluster_loja', 'promocao_inicio', 'promocao_fim',
-  'preco_por_unidade', 'moeda', 'imposto_incluso', 'coletor',
-  'metodo_coleta', 'confianca', 'observacao', 'versao_layout',
+  'data_preco', 'origem_preco', 'uf', 'regiao', 'cidade', 'rede', 'tipo_loja',
+  'loja', 'cnpj', 'cep', 'logradouro', 'numero_logradouro', 'complemento',
+  'bairro', 'categoria', 'secao', 'descricao', 'conteudo_qtd',
+  'conteudo_unidade', 'conteudo_descricao', 'conteudo_qtd_padronizada',
+  'conteudo_unidade_padronizada', 'gtin', 'id_produto', 'id_loja',
+  'tipo_produto', 'tipo_promocao', 'flag_promocao', 'latitude', 'longitude',
+  'fabricante', 'cnpj_fabricante', 'marca_propria', 'preco_pago',
+  'preco_regular', 'preco_unidade_padrao', 'valor_promocao', 'anuncio_flag',
+  'anuncio_campanha', 'anuncio_mecanica', 'anuncio_mecanica_detalhe',
+  'anuncio_grupo_de_midia', 'anuncio_midia', 'fonte_digital',
 ];
+
+/** Delimitador e marcador de nulo, como o Spark grava. */
+const DELIM = '|';
+const NULO = '\\N';
 
 const PRODUTOS = [
   ['7891000315507', 'LEITE CONDENSADO 395G', 'Laticínios', 'MOÇA', 6.49],
@@ -74,14 +79,15 @@ const PRODUTOS = [
   ['7896056801011', 'SABÃO EM PÓ 1KG', 'Limpeza', 'OMO', 16.49],
 ];
 
+/** [loja, rede, uf, cidade, região, tipo de loja, cnpj] */
 const LOJAS = [
-  ['SP-8841', '1042', 'SP', 'São Paulo'],
-  ['SP-1027', '388', 'SP', 'Campinas'],
-  ['SP-3390', '1042', 'SP', 'Santo André'],
-  ['SP-4415', '705', 'SP', 'Guarulhos'],
-  ['RJ-1120', '388', 'RJ', 'Rio de Janeiro'],
-  ['MG-2204', '705', 'MG', 'Belo Horizonte'],
-  ['RS-9017', '1042', 'RS', 'Porto Alegre'],
+  ['STOK_CENTER-5111625', 'STOK CENTER', 'RS', 'TORRES', 'Sul', 'HIPERMERCADO', '92016757009148'],
+  ['SUPER MUFFATO-440736', 'SUPER MUFFATO', 'PR', 'PARANAVAÍ', 'Sul', 'SUPERMERCADO', '76430438006102'],
+  ['PAO_DE_ACUCAR-1042', 'PÃO DE AÇÚCAR', 'SP', 'SÃO PAULO', 'Sudeste', 'SUPERMERCADO', '47508411000156'],
+  ['ASSAI-388', 'ASSAÍ', 'SP', 'CAMPINAS', 'Sudeste', 'ATACAREJO', '06057223000171'],
+  ['GUANABARA-1120', 'GUANABARA', 'RJ', 'RIO DE JANEIRO', 'Sudeste', 'SUPERMERCADO', '33171637000150'],
+  ['BH-2204', 'SUPERMERCADOS BH', 'MG', 'BELO HORIZONTE', 'Sudeste', 'SUPERMERCADO', '04641376000136'],
+  ['ZAFFARI-9017', 'ZAFFARI', 'RS', 'PORTO ALEGRE', 'Sul', 'HIPERMERCADO', '93015006000113'],
 ];
 
 const CATEGORIAS = [
@@ -163,10 +169,11 @@ function aleatorio(semente: number): () => number {
   };
 }
 
-function campo(valor: string | number): string {
+function campo(valor: string | number | null): string {
+  if (valor === null || valor === '') return NULO;
   const s = String(valor);
-  return s.includes(';') || s.includes('"')
-    ? `"${s.replace(/"/g, '""')}"`
+  return s.includes(DELIM) || s.includes('"')
+    ? `"${s.replace(/"/g, '\\"')}"`
     : s;
 }
 
@@ -178,7 +185,7 @@ function* gerarLinhas(
   deslocamento: number,
   semente: number,
 ): Generator<string> {
-  yield CABECALHO.join(';') + '\n';
+  yield CABECALHO.join(DELIM) + '\n';
 
   const rnd = aleatorio(
     Number(runDate.replace(/-/g, '')) + indiceArquivo * 7919 + semente * 104_729,
@@ -194,10 +201,14 @@ function* gerarLinhas(
 
     let gtin = produto.gtin;
     let descricao = produto.descricao;
-    let idLoja = loja[0] as string;
+    let idLoja: string | null = loja[0] as string;
     // Variação de ±12% no preço, para o merge ter o que atualizar entre runs.
     let preco = (produto.precoBase * (0.88 + rnd() * 0.24)).toFixed(2);
-    let dataColeta = runDate;
+    // O arquivo traz o último preço visto de cada produto em cada loja, então
+    // as datas se espalham pelos últimos 90 dias. A data depende só da posição
+    // da linha, não da semente: regerar com --semente muda o preço da mesma
+    // chave, o que exercita o caminho de atualização do merge.
+    let dataColeta = somarDias(runDate, -(global % 90));
     const promocao = rnd() < 0.18;
 
     // ── Defeitos semeados, um por regra de qualidade ──────────────────────
@@ -211,38 +222,38 @@ function* gerarLinhas(
     } else if (sorteio < 0.0016) {
       preco = '0.00'; // preço menor ou igual a zero
     } else if (sorteio < 0.0022) {
-      idLoja = `SP-${9000 + Math.floor(rnd() * 900)}`; // loja fora de dim_loja
+      idLoja = null; // linha sem loja
     } else if (sorteio < 0.0026) {
-      dataColeta = somarDias(runDate, -30); // fora da janela do run
+      dataColeta = somarDias(runDate, 3); // data posterior ao run
     } else if (sorteio < 0.0029) {
       descricao = descricao.replace('É', '\\xC9'); // encoding quebrado
       if (!descricao.includes('\\x')) descricao = `CAF\\xC9 ${descricao}`;
     } else if (sorteio < 0.0032) {
       // Linha que não tem como ser lida: aspa solta seguida de texto e de um
       // delimitador a mais. Vira rejeição sem interromper o arquivo.
-      descricaoBruta = `"${descricao}"x;sobra`;
+      descricaoBruta = `"${descricao}"x${DELIM}sobra`;
     } else if (sorteio < 0.0034) {
       // Não é defeito: aspa escapada com barra, como o Spark grava por padrão.
       // O leitor precisa aceitar a linha normalmente.
       descricaoBruta = `"${descricao} TV 50\\" LED"`;
     }
 
-    const precoPromo = promocao ? (Number(preco) * 0.82).toFixed(2) : '';
-    const linha = [
-      gtin, descricao, idLoja, loja[1], loja[2], loja[3],
-      preco, precoPromo, promocao ? 'Promoção' : 'Regular', dataColeta,
-      `PSQ-${runDate.replace(/-/g, '')}`, `PRD-${gtin.slice(-6)}`,
-      produto.categoria, 'Geral', produto.marca, produto.marca, 'UN', '1', 'UN',
-      '00000000', '0000000', 'SFTP', 'Autosserviço', 'Supermercado',
-      '00000000000191', 'Rua Exemplo, 100', 'Centro', '01001000',
-      '-23.55', '-46.63', 'Sudeste', 'A', '', '',
-      preco, 'BRL', 'S', 'coletor-automatico', 'sftp',
-      (0.9 + rnd() * 0.1).toFixed(2), '', 'v1',
+    const precoPago = promocao ? (Number(preco) * 0.82).toFixed(2) : preco;
+    const linha: (string | number | null)[] = [
+      dataColeta, 'App/Sites proprios', loja[2]!, loja[4]!, loja[3]!, loja[1]!,
+      loja[5]!, idLoja, loja[6]!, '95560000', 'RUA EXEMPLO', '100', null,
+      'CENTRO', produto.categoria.toUpperCase(), 'MERCEARIA', descricao,
+      '1.0', 'UN', '1UN', '1.0', 'UN', gtin, null, null, 'GTIN',
+      promocao ? 'DESCONTO' : null, promocao ? 'true' : 'false',
+      '-29.3383976', '-49.728226', produto.marca, '14049467000130', 'false',
+      precoPago, preco, preco,
+      promocao ? (Number(preco) - Number(precoPago)).toFixed(2) : '0.00',
+      null, null, null, null, null, null, 'fixture',
     ];
 
     const celulas = linha.map(campo);
-    if (descricaoBruta) celulas[1] = descricaoBruta;
-    yield celulas.join(';') + '\n';
+    if (descricaoBruta) celulas[CABECALHO.indexOf('descricao')] = descricaoBruta;
+    yield celulas.join(DELIM) + '\n';
   }
 }
 

@@ -4,7 +4,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { config } from '../config.js';
 
 /**
- * Colunas que o pipeline usa do arquivo da InfoPrice. O arquivo traz 42
+ * Colunas que o pipeline usa do arquivo da InfoPrice. O arquivo traz 44
  * colunas; estas são as que alimentam staging e fato. As demais seguem
  * preservadas no campo `payload`, então nada se perde na rastreabilidade.
  */
@@ -16,7 +16,14 @@ export const COLUNAS_OBRIGATORIAS = [
   'data_coleta',
 ] as const;
 
-/** Sinônimos aceitos no cabeçalho, para absorver variação da origem. */
+/**
+ * Sinônimos aceitos no cabeçalho, para absorver variação da origem.
+ *
+ * O layout da InfoPrice (ISA-InfoPanel) usa data_preco, loja, cidade e
+ * preco_regular. Ele também traz uma coluna id_loja, quase sempre nula: quando
+ * duas colunas caem no mesmo nome interno, vale o primeiro valor não vazio
+ * (ver `emitir`), então `loja` prevalece e `id_loja` só cobre a ausência dela.
+ */
 const SINONIMOS: Record<string, string> = {
   ean: 'gtin',
   codigo_barras: 'gtin',
@@ -43,7 +50,31 @@ const SINONIMOS: Record<string, string> = {
   data: 'data_coleta',
   dt_coleta: 'data_coleta',
   data_pesquisa: 'data_coleta',
+  data_preco: 'data_coleta',
 };
+
+/** Como o Spark (e o Hive) grava nulo em CSV. */
+const NULO = '\\N';
+
+const VERDADEIRO = /^(true|1|s|sim|y|yes)$/i;
+
+/**
+ * Completa os campos que o layout da InfoPrice não traz com o nome interno.
+ *
+ * - preco: o preço regular (de gôndola); sem ele, o preço pago.
+ * - preco_promocional: o preço pago, quando a linha está em promoção.
+ * - tipo_preco: Promoção ou Regular, a partir de flag_promocao.
+ */
+function derivarCampos(c: Record<string, string>): void {
+  const promocao = VERDADEIRO.test(c.flag_promocao ?? '');
+  if (!c.preco && c.preco_pago) c.preco = c.preco_pago;
+  if (!c.preco_promocional && promocao && c.preco_pago) {
+    c.preco_promocional = c.preco_pago;
+  }
+  if (!c.tipo_preco && c.flag_promocao) {
+    c.tipo_preco = promocao ? 'Promoção' : 'Regular';
+  }
+}
 
 /**
  * Quantas linhas físicas um campo entre aspas pode atravessar. Acima disso a
@@ -56,7 +87,7 @@ const MAX_LINHAS_POR_REGISTRO = 50;
 /** Teto do payload guardado para uma linha que não pôde ser lida. */
 const MAX_PAYLOAD_MALFORMADO = 10_000;
 
-const DELIMITADORES = [';', ',', '\t'] as const;
+const DELIMITADORES = ['|', ';', ',', '\t'] as const;
 
 function limparNome(nome: string): string {
   return nome
@@ -391,8 +422,13 @@ export async function lerCsv(
     const campos: Record<string, string> = {};
     if (!erro) {
       cabecalho.forEach((coluna, i) => {
-        if (coluna) campos[coluna] = valores[i] ?? '';
+        if (!coluna) return;
+        const bruto = valores[i] ?? '';
+        const valor = bruto === NULO ? '' : bruto;
+        // Duas colunas no mesmo nome interno: fica o primeiro valor não vazio.
+        if (!campos[coluna]) campos[coluna] = valor;
       });
+      derivarCampos(campos);
     }
     // O payload guarda a linha como veio, para a tela de rejeições poder
     // mostrar o original.
