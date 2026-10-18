@@ -136,16 +136,17 @@ export async function carregarArquivoEmStaging(
 }
 
 /**
- * Limpa o staging do run antes de recarregar.
- * É o que torna a reexecução do mesmo run segura: o espelho é reconstruído do
- * zero em vez de acumular linhas de tentativas anteriores.
+ * Limpa o staging do arquivo antes de recarregá-lo.
+ * É o que torna a reexecução segura: o espelho do arquivo é reconstruído do
+ * zero em vez de acumular linhas de tentativas anteriores. O id do arquivo é
+ * estável entre execuções (identidade pasta + nome em ctl_arquivo).
  */
-export async function limparStaging(
+export async function limparStagingArquivo(
   cliente: Cliente,
-  runDate: string,
+  idArquivo: number,
 ): Promise<void> {
   await cliente.query(
-    'DELETE FROM infoprice.stg_isa_infopanel_preco WHERE run_date = $1',
-    [runDate],
+    'DELETE FROM infoprice.stg_isa_infopanel_preco WHERE id_arquivo = $1',
+    [idArquivo],
   );
 }

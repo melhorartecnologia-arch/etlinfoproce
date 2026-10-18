@@ -78,33 +78,45 @@ A coleta roda em dez etapas, as mesmas que aparecem no painel:
 | 2 | Listagem do diretório | acha a pasta `run=AAAA-MM-DD` e compara o volume com a média de 7 dias |
 | 3 | Download para área temporária | baixa em paralelo para `var/spool/infoprice` |
 | 4 | Verificação de integridade | SHA-256 do arquivo e do conteúdo descompactado |
-| 5 | Validação de schema | confere as colunas obrigatórias no cabeçalho |
+| 5 | Validação de schema | confere só o cabeçalho de cada arquivo, antes de carregar |
 | 6 | Carga em staging | `COPY` em `stg_isa_infopanel_preco`, tudo como texto |
-| 7 | Regras de qualidade | sete regras; a linha reprovada vai para `ctl_rejeicao` com o payload original |
+| 7 | Regras de qualidade | oito regras; a linha reprovada vai para `ctl_rejeicao` com o payload original |
 | 8 | Merge incremental | `UPSERT` em `fact_preco_coletado` pela chave de conflito |
 | 9 | Auditoria e watermark | fecha `ctl_execucao` e avança `ctl_watermark` |
 | 10 | Notificação | resumo no painel e por e-mail |
 
-As etapas 6 a 9 rodam **numa transação só**. Qualquer falha reverte tudo e a
-tabela final continua com o dado da execução anterior — o log do que aconteceu,
-porém, é gravado fora da transação e sobrevive para explicar o motivo.
+As etapas 6 a 8 rodam **arquivo a arquivo, cada um numa transação própria**:
+o arquivo passa por staging, regras e merge e é efetivado antes de o próximo
+começar. O que já foi gravado fica gravado — uma falha no arquivo 30 reverte
+só o arquivo 30, os demais seguem, a execução fecha como parcial e a varredura
+tenta o arquivo de novo. O painel mostra o avanço a cada arquivo, e o log
+registra uma linha por arquivo gravado (lidas, rejeitadas, inseridas,
+atualizadas, duração). O log é gravado fora das transações e sobrevive para
+explicar qualquer falha.
 
-**Idempotência.** Reexecutar o mesmo run é seguro: o staging daquele run é
+A etapa 5 confere o cabeçalho de todos os arquivos antes de carregar qualquer
+linha, então um layout errado é recusado em segundos, com a primeira linha do
+arquivo no log para diagnóstico.
+
+**Idempotência.** Reexecutar o mesmo run é seguro: o staging de cada arquivo é
 apagado e recarregado, e o `UPSERT` só conta como atualização a linha cujo preço
 mudou de fato. Reprocessar um dia sem alteração na origem grava zero linhas.
 
-### As sete regras de qualidade
+### As oito regras de qualidade
 
-Rodam em ordem sobre o staging; a primeira que pega a linha é a dona da
-rejeição, então uma linha nunca aparece com dois motivos.
+Rodam em ordem sobre o staging de cada arquivo; a primeira que pega a linha é a
+dona da rejeição, então uma linha nunca aparece com dois motivos.
 
 1. Linha malformada no arquivo (não pôde ser separada em colunas)
 2. GTIN inválido no dígito verificador (módulo 10 GS1, em `infoprice.gtin_valido`)
 3. Preço menor ou igual a zero
-4. Loja ausente em `dim_loja`
-5. Data de coleta fora da janela do run
-6. Duplicidade na chave de conflito — mantém a última ocorrência
-7. Caractere inválido na descrição (encoding quebrado)
+4. Preço acima do limite (o fato guarda `numeric(12,2)`; maior que isso estouraria o merge)
+5. Loja ausente em `dim_loja`
+6. Data de coleta fora da janela do run
+7. Duplicidade na chave de conflito, dentro do arquivo — mantém a última
+   ocorrência. A mesma chave em outro arquivo do run vira atualização no merge
+   do arquivo seguinte.
+8. Caractere inválido na descrição (encoding quebrado)
 
 ### Leitura tolerante do CSV
 
@@ -115,9 +127,26 @@ Uma aspa solta é lida como texto quando a linha ainda tem o número certo de
 colunas; quando não tem, a linha entra no staging com o texto original e cai
 na regra 1. O log da execução conta as linhas de cada caso, por arquivo.
 
-Se a carga de um arquivo falhar por outro motivo, só ele é desfeito (cada
-arquivo carrega sob um savepoint): os demais seguem, a execução fecha como
-parcial e a varredura tenta o arquivo de novo.
+### Layout do arquivo
+
+As colunas obrigatórias são `gtin`, `descricao`, `id_loja`, `preco` e
+`data_coleta`; alguns nomes alternativos comuns (`ean`, `produto`,
+`codigo_loja`, `valor`, `dt_coleta`…) já são reconhecidos. Para ver como um
+arquivo é interpretado — delimitador, cada coluna e para qual nome interno ela
+foi mapeada, o que falta:
+
+```bash
+npm run inspecionar-arquivo --workspace @infoprice/server -- caminho/part-00000.csv.gz
+```
+
+Sem argumento, ele pega o arquivo mais recente da área temporária. Conforme o
+resultado, ajuste no `server/.env`:
+
+- **Nomes diferentes** — `MAPA_COLUNAS=gtin=cd_ean,preco=vl_preco,...`
+  (coluna interna = nome no arquivo).
+- **Arquivo sem cabeçalho** (o padrão do Spark ao gravar CSV) —
+  `CSV_COLUNAS=gtin,descricao,id_loja,...` com os nomes na ordem das colunas;
+  a primeira linha passa a ser lida como dado.
 
 ### Rastreabilidade
 

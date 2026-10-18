@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 import { StringDecoder } from 'node:string_decoder';
+import { config } from '../config.js';
 
 /**
  * Colunas que o pipeline usa do arquivo da InfoPrice. O arquivo traz 42
@@ -57,15 +58,138 @@ const MAX_PAYLOAD_MALFORMADO = 10_000;
 
 const DELIMITADORES = [';', ',', '\t'] as const;
 
-export function normalizarCabecalho(nome: string): string {
-  const limpo = nome
+function limparNome(nome: string): string {
+  return nome
     .trim()
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
-  return SINONIMOS[limpo] ?? limpo;
+}
+
+/** MAPA_COLUNAS: nome no arquivo → coluna interna. Vale antes dos sinônimos. */
+const MAPA_CONFIGURADO = new Map(
+  config.coleta.mapaColunas
+    .map((par) => par.split('='))
+    .filter((p): p is [string, string] => p.length === 2 && !!p[0] && !!p[1])
+    .map(([interna, noArquivo]) => [limparNome(noArquivo), limparNome(interna)]),
+);
+
+export function normalizarCabecalho(nome: string): string {
+  const limpo = limparNome(nome);
+  return MAPA_CONFIGURADO.get(limpo) ?? SINONIMOS[limpo] ?? limpo;
+}
+
+export interface InfoCabecalho {
+  delimitador: string;
+  /** Nomes já normalizados e mapeados para o vocabulário interno. */
+  colunas: string[];
+  /** A primeira linha como veio, para o diagnóstico. */
+  primeiraLinha: string;
+  /** Os nomes vieram de CSV_COLUNAS: a primeira linha do arquivo é dado. */
+  semCabecalho: boolean;
+  /** A primeira linha tem cara de dado (GTIN, data, número) e não de nomes. */
+  pareceDado: boolean;
+}
+
+const PADROES_DADO = [
+  /^\d{8,14}$/, // GTIN
+  /^\d{4}-\d{2}-\d{2}/, // data ISO
+  /^\d{2}\/\d{2}\/\d{4}$/, // data dd/mm/aaaa
+  /^-?\d+[.,]\d+$/, // número decimal
+];
+
+/** Interpreta a primeira linha não vazia do arquivo. */
+export function analisarCabecalho(linha: string): InfoCabecalho {
+  const primeiraLinha = linha.replace(/^\uFEFF/, '');
+  const delimitador = detectarDelimitador(primeiraLinha);
+  const campos = analisarRegistro(primeiraLinha, delimitador).campos;
+  const semCabecalho = config.coleta.colunasPosicao.length > 0;
+  return {
+    delimitador,
+    colunas: (semCabecalho ? config.coleta.colunasPosicao : campos).map(
+      normalizarCabecalho,
+    ),
+    primeiraLinha,
+    semCabecalho,
+    pareceDado: campos.some((c) => PADROES_DADO.some((p) => p.test(c.trim()))),
+  };
+}
+
+export interface RecusaCabecalho {
+  /** O que falta e como resolver — igual para arquivos com o mesmo defeito. */
+  motivo: string;
+  /** A primeira linha do arquivo, para quem for corrigir ver o que chegou. */
+  amostra: string;
+}
+
+/**
+ * Confere se o cabeçalho traz as colunas obrigatórias. Devolve o motivo da
+ * recusa e o que foi encontrado, ou null quando está tudo certo.
+ */
+export function validarCabecalho(info: InfoCabecalho): RecusaCabecalho | null {
+  const faltando = COLUNAS_OBRIGATORIAS.filter((c) => !info.colunas.includes(c));
+  if (faltando.length === 0) return null;
+
+  const partes = [`sem ${faltando.join(', ')}`];
+  if (info.pareceDado && !info.semCabecalho) {
+    partes.push(
+      'a primeira linha parece ser dado e não cabeçalho — se o arquivo não tem ' +
+        'cabeçalho, informe os nomes das colunas na ordem em CSV_COLUNAS',
+    );
+  } else {
+    partes.push(
+      'se os nomes do arquivo são outros, mapeie em MAPA_COLUNAS ' +
+        '(ex.: gtin=nome_no_arquivo)',
+    );
+  }
+  const tab = info.delimitador === '\t' ? 'tab' : info.delimitador;
+  return {
+    motivo: partes.join(' · '),
+    amostra:
+      `primeira linha (${info.colunas.length} colunas, delimitador "${tab}"): ` +
+      info.primeiraLinha.slice(0, 500),
+  };
+}
+
+/** Lê só a primeira linha não vazia do arquivo, sem descompactar o resto. */
+export async function lerCabecalho(caminho: string): Promise<InfoCabecalho> {
+  const entrada = fs.createReadStream(caminho);
+  const bytes = caminho.endsWith('.gz')
+    ? entrada.pipe(zlib.createGunzip())
+    : entrada;
+  entrada.on('error', (erro) => bytes.destroy(erro));
+  try {
+    for await (const linha of linhasFisicas(bytes)) {
+      if (linha.replace(/^\uFEFF/, '').trim() !== '') return analisarCabecalho(linha);
+    }
+    throw new Error('arquivo vazio');
+  } finally {
+    entrada.destroy();
+    bytes.destroy();
+  }
+}
+
+/** As primeiras linhas não vazias do arquivo, como vieram (para diagnóstico). */
+export async function primeirasLinhas(caminho: string, quantidade: number): Promise<string[]> {
+  const entrada = fs.createReadStream(caminho);
+  const bytes = caminho.endsWith('.gz')
+    ? entrada.pipe(zlib.createGunzip())
+    : entrada;
+  entrada.on('error', (erro) => bytes.destroy(erro));
+  const linhas: string[] = [];
+  try {
+    for await (const linha of linhasFisicas(bytes)) {
+      if (linha.trim() === '') continue;
+      linhas.push(linha);
+      if (linhas.length >= quantidade) break;
+    }
+    return linhas;
+  } finally {
+    entrada.destroy();
+    bytes.destroy();
+  }
 }
 
 export interface LinhaLida {
@@ -285,11 +409,19 @@ export async function lerCsv(
       const primeira = pendentes[0]!;
 
       if (cabecalho.length === 0) {
-        pendentes.shift();
-        const semBom = primeira.replace(/^\uFEFF/, '');
-        if (semBom.trim() === '') continue;
-        delim = detectarDelimitador(semBom);
-        cabecalho = analisarRegistro(semBom, delim).campos.map(normalizarCabecalho);
+        if (primeira.replace(/^\uFEFF/, '').trim() === '') {
+          pendentes.shift();
+          continue;
+        }
+        const info = analisarCabecalho(primeira);
+        delim = info.delimitador;
+        cabecalho = info.colunas;
+        if (info.semCabecalho) {
+          // A primeira linha é dado: fica para ser lida como registro.
+          pendentes[0] = info.primeiraLinha;
+        } else {
+          pendentes.shift();
+        }
         continue;
       }
 

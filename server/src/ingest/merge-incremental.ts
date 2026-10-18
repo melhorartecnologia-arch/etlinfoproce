@@ -21,7 +21,7 @@ export interface ResultadoMerge {
  */
 export const SQL_PERSISTENCIA = `INSERT INTO infoprice.fact_preco_coletado AS f
 SELECT * FROM infoprice.stg_isa_infopanel_preco
-WHERE run_date = DATE '{run}'
+WHERE run_date = DATE '{run}' AND id_arquivo = :arquivo  -- um arquivo por transação
 ON CONFLICT (gtin, id_loja, data_coleta, fonte)
 DO UPDATE SET preco = EXCLUDED.preco,
               id_execucao = EXCLUDED.id_execucao,
@@ -37,11 +37,13 @@ WHERE f.preco IS DISTINCT FROM EXCLUDED.preco;`;
 async function garantirParticoes(
   cliente: Cliente,
   idExecucao: number,
+  idArquivo: number,
 ): Promise<string[]> {
   const { rows } = await cliente.query<{ mes: string }>(
     `SELECT DISTINCT date_trunc('month', infoprice.para_data(s.data_coleta))::date::text AS mes
        FROM infoprice.stg_isa_infopanel_preco s
       WHERE s.id_execucao = $1
+        AND s.id_arquivo = $2
         AND infoprice.para_data(s.data_coleta) IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM infoprice.ctl_rejeicao r
@@ -50,7 +52,7 @@ async function garantirParticoes(
              AND r.numero_linha = s.numero_linha
         )
       ORDER BY 1`,
-    [idExecucao],
+    [idExecucao, idArquivo],
   );
 
   const particoes: string[] = [];
@@ -80,8 +82,9 @@ async function garantirParticoes(
 export async function mergeIncremental(
   cliente: Cliente,
   idExecucao: number,
+  idArquivo: number,
 ): Promise<ResultadoMerge> {
-  const particoes = await garantirParticoes(cliente, idExecucao);
+  const particoes = await garantirParticoes(cliente, idExecucao, idArquivo);
 
   const { rows } = await cliente.query<{
     id_arquivo: number;
@@ -105,6 +108,7 @@ export async function mergeIncremental(
               s.numero_linha
          FROM infoprice.stg_isa_infopanel_preco s
         WHERE s.id_execucao = $1
+          AND s.id_arquivo = $2
           AND NOT EXISTS (
             SELECT 1 FROM infoprice.ctl_rejeicao r
              WHERE r.id_execucao = s.id_execucao
@@ -142,7 +146,7 @@ export async function mergeIncremental(
             count(*) FILTER (WHERE NOT foi_insert)::bigint AS atualizadas
        FROM gravadas
       GROUP BY id_arquivo`,
-    [idExecucao],
+    [idExecucao, idArquivo],
   );
 
   const porArquivo = new Map<number, ContagemArquivo>();
@@ -166,39 +170,4 @@ export async function mergeIncremental(
     particoes,
     porArquivo,
   };
-}
-
-export interface ContagemStagingArquivo {
-  idArquivo: number;
-  arquivo: string;
-  staging: number;
-  rejeitadas: number;
-}
-
-/** Linhas em staging e rejeitadas por arquivo — contagens exatas, sem heurística. */
-export async function contagensStagingPorArquivo(
-  cliente: Cliente,
-  idExecucao: number,
-): Promise<ContagemStagingArquivo[]> {
-  const { rows } = await cliente.query<{
-    idArquivo: number;
-    arquivo: string;
-    staging: number;
-    rejeitadas: number;
-  }>(
-    `SELECT s.id_arquivo        AS "idArquivo",
-            s.arquivo           AS arquivo,
-            count(*)::bigint    AS staging,
-            count(r.id)::bigint AS rejeitadas
-       FROM infoprice.stg_isa_infopanel_preco s
-       LEFT JOIN infoprice.ctl_rejeicao r
-              ON r.id_execucao = s.id_execucao
-             AND r.arquivo = s.arquivo
-             AND r.numero_linha = s.numero_linha
-      WHERE s.id_execucao = $1
-      GROUP BY s.id_arquivo, s.arquivo
-      ORDER BY s.arquivo`,
-    [idExecucao],
-  );
-  return rows;
 }

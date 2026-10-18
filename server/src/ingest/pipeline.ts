@@ -9,13 +9,17 @@ import { consultarUm, emTransacao, pool } from '../db/pool.js';
 import { comOrigem, type ArquivoRemoto, type DriverOrigem } from '../sftp/index.js';
 import { bytesBR, duracaoBR, numeroBR, percentualBR } from '../util/formato.js';
 import { somarDias } from '../util/tempo.js';
-import { carregarArquivoEmStaging, limparStaging } from './carga-staging.js';
-import { COLUNAS_OBRIGATORIAS } from './leitor-csv.js';
+import { carregarArquivoEmStaging, limparStagingArquivo } from './carga-staging.js';
 import {
-  contagensStagingPorArquivo,
-  mergeIncremental,
-} from './merge-incremental.js';
-import { aplicarRegrasQualidade } from './regras-qualidade.js';
+  COLUNAS_OBRIGATORIAS,
+  lerCabecalho,
+  validarCabecalho,
+} from './leitor-csv.js';
+import { mergeIncremental } from './merge-incremental.js';
+import {
+  aplicarRegrasQualidade,
+  type ContagemMotivo,
+} from './regras-qualidade.js';
 import { RegistroExecucao } from './registro-execucao.js';
 import { avaliarPosExecucao, notificarResultado } from '../alertas/index.js';
 
@@ -97,9 +101,10 @@ async function emParalelo<T, R>(
 /**
  * A coleta diária, nas dez etapas que aparecem no painel.
  *
- * Etapas 1 a 5 acontecem fora de transação (rede e disco). As etapas 6 a 9 —
- * staging, qualidade, merge e watermark — rodam numa transação única: qualquer
- * falha ali reverte tudo e a tabela final continua com o dado do dia anterior.
+ * Etapas 1 a 5 acontecem fora de transação (rede e disco); a 5 confere só o
+ * cabeçalho de cada arquivo. As etapas 6 a 8 — staging, qualidade e merge —
+ * rodam arquivo a arquivo, cada um na sua transação: um arquivo é efetivado
+ * por inteiro antes do próximo começar, e uma falha reverte apenas ele.
  */
 export async function executarColeta(
   opcoes: OpcoesColeta,
@@ -303,238 +308,199 @@ async function rodarEtapas(
   });
 
   // ── 5 · Validação de schema ───────────────────────────────────────────────
-  // Feita durante a carga: o cabeçalho de cada arquivo é conferido no COPY.
-  // Aqui só abrimos a etapa; ela é fechada depois da leitura do primeiro lote.
-  let colunasVistas = 0;
-  let divergencias: string[] = [];
+  // Só o cabeçalho de cada arquivo, antes de carregar qualquer linha: um
+  // arquivo fora do layout é recusado em segundos, e não depois do COPY.
+  const aptos = await registro.etapa('Validação de schema', async () => {
+    const validos: ArquivoLocal[] = [];
+    // motivo → arquivos recusados por ele e a amostra do primeiro.
+    const recusas = new Map<string, { nomes: string[]; amostra: string }>();
+    let colunas = 0;
 
-  // ── 6 a 9 · staging → qualidade → merge → watermark, em uma transação ─────
-  // `longa`: esta transação abriga o COPY, as regras de qualidade e o merge,
-  // que passam bem do teto de 30s aplicado às consultas de tela.
-  const totais = await emTransacao(async (cliente) => {
-    // 5 · validação de schema + 6 · carga em staging
-    await registro.iniciarEtapa('Validação de schema');
-    await registro.iniciarEtapa('Carga em staging');
-    await registro.info(
-      `BEGIN · limpando stg_isa_infopanel_preco WHERE run_date = ${runDate}`,
-    );
-    await limparStaging(cliente, runDate);
-
-    let linhasStaging = 0;
-    const comErro: string[] = [];
     for (const arquivo of baixados) {
-      // Cada arquivo carrega sob um savepoint: se um deles falhar, só ele é
-      // desfeito, e os demais seguem para qualidade e merge. A execução fecha
-      // como parcial e a varredura tenta o arquivo de novo.
-      await cliente.query('SAVEPOINT carga_arquivo');
-      let carga: Awaited<ReturnType<typeof carregarArquivoEmStaging>>;
+      let recusa: { motivo: string; amostra: string } | null;
       try {
-        carga = await carregarArquivoEmStaging({
-          cliente,
-          idExecucao: registro.id,
-          idArquivo: arquivo.idArquivo,
-          arquivo: arquivo.nome,
-          caminhoLocal: arquivo.caminhoLocal,
-          runDate,
-          fonte: config.coleta.fonte,
-        });
-        await cliente.query('RELEASE SAVEPOINT carga_arquivo');
+        const info = await lerCabecalho(arquivo.caminhoLocal);
+        colunas = Math.max(colunas, info.colunas.length);
+        recusa = validarCabecalho(info);
       } catch (erro) {
-        await cliente.query('ROLLBACK TO SAVEPOINT carga_arquivo');
-        const msg = erro instanceof Error ? erro.message : String(erro);
-        comErro.push(arquivo.nome);
-        await registro.erro(
-          `COPY ${arquivo.nome} desfeito: ${msg} · os demais arquivos seguem`,
-        );
-        await pool.query(
-          `UPDATE infoprice.ctl_execucao_arquivo
-              SET status = 'erro', erro = $3
-            WHERE id_execucao = $1 AND id_arquivo = $2`,
-          [registro.id, arquivo.idArquivo, msg],
-        );
-        await pool.query(
-          `UPDATE infoprice.ctl_arquivo
-              SET status = 'erro', erro = $2, atualizado_em = now()
-            WHERE id = $1`,
-          [arquivo.idArquivo, msg],
-        );
-        continue;
+        recusa = { motivo: erro instanceof Error ? erro.message : String(erro), amostra: '' };
       }
 
-      colunasVistas = Math.max(colunasVistas, carga.colunas);
-      const faltando = COLUNAS_OBRIGATORIAS.filter(
-        (c) => !carga.cabecalho.includes(c),
-      );
-      if (faltando.length > 0) {
-        divergencias.push(`${arquivo.nome}: sem ${faltando.join(', ')}`);
-      }
-
-      linhasStaging += carga.linhas;
-      await pool.query(
-        `UPDATE infoprice.ctl_execucao_arquivo
-            SET linhas_lidas = $3
-          WHERE id_execucao = $1 AND id_arquivo = $2`,
-        [registro.id, arquivo.idArquivo, carga.linhas],
-      );
-      await registro.info(
-        `COPY ${arquivo.nome} → ${numeroBR(carga.linhas)} linhas`,
-      );
-      if (carga.recuperadas > 0) {
-        await registro.warn(
-          `${arquivo.nome}: ${numeroBR(carga.recuperadas)} linhas com aspas fora do padrão lidas em modo tolerante`,
-        );
-      }
-      if (carga.malformadas > 0) {
-        await registro.warn(
-          `${arquivo.nome}: ${numeroBR(carga.malformadas)} linhas malformadas seguem como rejeição`,
-        );
-      }
-    }
-
-    if (comErro.length > 0 && comErro.length === baixados.length) {
-      throw new Error(
-        `nenhum arquivo pôde ser carregado (${comErro.length} com erro)`,
-      );
-    }
-
-    if (divergencias.length > 0) {
-      const detalhe = divergencias.join(' · ');
-      await registro.falharEtapa('Validação de schema', detalhe);
-      throw new Error(`schema divergente · ${detalhe}`);
-    }
-
-    await registro.concluirEtapa(
-      'Validação de schema',
-      `${colunasVistas} colunas · 0 divergências`,
-    );
-    await registro.info(
-      `schema validado · ${colunasVistas} colunas · tipos coerentes com stg_isa_infopanel_preco`,
-    );
-    await registro.concluirEtapa(
-      'Carga em staging',
-      `COPY → stg_isa_infopanel_preco · ${numeroBR(linhasStaging)}` +
-        (comErro.length > 0 ? ` · ${comErro.length} arquivo(s) com erro` : ''),
-    );
-
-    // 7 · Regras de qualidade
-    await registro.iniciarEtapa('Regras de qualidade');
-    const contagens = await aplicarRegrasQualidade(
-      cliente,
-      registro.id,
-      runDate,
-    );
-    const rejeitadas = contagens.reduce((s, c) => s + c.quantidade, 0);
-    for (const c of contagens.filter((x) => x.quantidade > 0)) {
-      await registro.info(`  ${c.motivo}: ${numeroBR(c.quantidade)}`);
-    }
-    if (rejeitadas > 0) {
-      await registro.warn(
-        `${numeroBR(rejeitadas)} linhas reprovadas nas regras de qualidade · gravadas em ctl_rejeicao`,
-      );
-    }
-    await registro.concluirEtapa(
-      'Regras de qualidade',
-      `${numeroBR(rejeitadas)} rejeições → ctl_rejeicao`,
-    );
-
-    // 8 · Merge incremental
-    await registro.iniciarEtapa('Merge incremental');
-    await registro.info(
-      'upsert fact_preco_coletado · chave (gtin, id_loja, data_coleta, fonte)',
-    );
-    const merge = await mergeIncremental(cliente, registro.id);
-    await registro.concluirEtapa(
-      'Merge incremental',
-      `UPSERT → fact_preco_coletado · ${numeroBR(merge.gravadas)}`,
-    );
-
-    // Contagens por arquivo, para a linhagem.
-    const porArquivo = await contagensStagingPorArquivo(cliente, registro.id);
-    for (const linha of porArquivo) {
-      const m = merge.porArquivo.get(linha.idArquivo);
-      await cliente.query(
-        `UPDATE infoprice.ctl_execucao_arquivo
-            SET linhas_gravadas = $3,
-                linhas_rejeitadas = $4,
-                linhas_inseridas = $5,
-                linhas_atualizadas = $6,
-                destino = 'stg → fact',
-                status = 'ingerido',
-                ingerido_em = now()
-          WHERE id_execucao = $1 AND id_arquivo = $2`,
-        [
+      if (recusa) {
+        await marcarArquivoComErro(
           registro.id,
-          linha.idArquivo,
-          (m?.inseridas ?? 0) + (m?.atualizadas ?? 0),
-          linha.rejeitadas,
-          m?.inseridas ?? 0,
-          m?.atualizadas ?? 0,
-        ],
-      );
-
-      // O inventário guarda só a situação atual do arquivo na origem.
-      await cliente.query(
-        `UPDATE infoprice.ctl_arquivo
-            SET status = 'ingerido', ingerido_em = now(), atualizado_em = now()
-          WHERE id = $1`,
-        [linha.idArquivo],
-      );
+          arquivo.idArquivo,
+          `schema divergente · ${recusa.motivo}` + (recusa.amostra ? ` · ${recusa.amostra}` : ''),
+        );
+        const grupo = recusas.get(recusa.motivo) ?? { nomes: [], amostra: recusa.amostra };
+        grupo.nomes.push(arquivo.nome);
+        recusas.set(recusa.motivo, grupo);
+      } else {
+        validos.push(arquivo);
+      }
     }
 
-    // 9 · Auditoria e watermark
-    await registro.iniciarEtapa('Auditoria e watermark');
-    const anterior = await cliente.query<{ data_run: string }>(
-      'SELECT data_run FROM infoprice.ctl_watermark WHERE fonte = $1',
-      [config.coleta.fonte],
-    );
-    const watermarkAnterior = anterior.rows[0]?.data_run ?? null;
+    // Um evento por motivo, não por arquivo: 50 arquivos com o mesmo
+    // cabeçalho errado são um problema só.
+    const descrever = (motivo: string, g: { nomes: string[]; amostra: string }) =>
+      `${g.nomes.length} de ${baixados.length} arquivos · ${motivo}` +
+      (g.amostra ? ` · ${g.amostra}` : '') +
+      ` · ${g.nomes.length > 3 ? `${g.nomes.slice(0, 3).join(', ')} e outros` : g.nomes.join(', ')}`;
+    for (const [motivo, grupo] of recusas) {
+      await registro.erro(`recusados por schema · ${descrever(motivo, grupo)}`);
+    }
 
-    await cliente.query(
-      `INSERT INTO infoprice.ctl_watermark (fonte, data_run, id_execucao)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (fonte) DO UPDATE
-          SET data_run = GREATEST(infoprice.ctl_watermark.data_run, EXCLUDED.data_run),
-              id_execucao = EXCLUDED.id_execucao,
-              atualizado_em = now()`,
-      [config.coleta.fonte, runDate, registro.id],
-    );
+    if (validos.length === 0) {
+      const [motivo, grupo] = [...recusas][0]!;
+      throw new Error(`schema divergente · ${descrever(motivo, grupo)}`);
+    }
 
-    await registro.concluirEtapa(
-      'Auditoria e watermark',
-      `ctl_execucao · watermark ${runDate}`,
-    );
     await registro.info(
-      `COMMIT · ${numeroBR(merge.gravadas)} linhas efetivadas · ` +
-        `${numeroBR(merge.inseridas)} inseridas · ${numeroBR(merge.atualizadas)} atualizadas`,
+      `schema validado · ${colunas} colunas · ${validos.length} de ${baixados.length} arquivos aptos`,
     );
-
     return {
-      linhasStaging,
-      rejeitadas,
-      merge,
-      watermarkAnterior,
-      arquivosIngeridos: porArquivo.length,
+      resultado: validos,
+      detalhe:
+        `${colunas} colunas · ${validos.length} de ${baixados.length} arquivos aptos` +
+        (recusas.size > 0 ? ` · ${baixados.length - validos.length} recusados` : ''),
     };
-  }, { longa: true });
-
-  const percentual =
-    totais.linhasStaging > 0
-      ? (totais.rejeitadas / totais.linhasStaging) * 100
-      : 0;
-
-  await registro.atualizar({
-    arquivos_ingeridos: totais.arquivosIngeridos,
-    linhas_staging: totais.linhasStaging,
-    linhas_gravadas: totais.merge.gravadas,
-    linhas_inseridas: totais.merge.inseridas,
-    linhas_atualizadas: totais.merge.atualizadas,
-    linhas_rejeitadas: totais.rejeitadas,
-    watermark_anterior: totais.watermarkAnterior,
-    watermark_novo: runDate,
   });
 
+  // ── 6 a 8 · um arquivo por vez, do staging à gravação ─────────────────────
+  // Cada arquivo passa por staging, regras de qualidade e merge numa transação
+  // própria e é efetivado antes do próximo começar. O que já foi gravado fica
+  // gravado: uma falha no arquivo 30 não desfaz os 29 anteriores — reverte só
+  // o arquivo 30, que a varredura tenta de novo.
+  await registro.iniciarEtapa('Carga em staging');
+  await registro.iniciarEtapa('Regras de qualidade');
+  await registro.iniciarEtapa('Merge incremental');
+
+  const totais = {
+    arquivosIngeridos: 0,
+    linhasStaging: 0,
+    rejeitadas: 0,
+    inseridas: 0,
+    atualizadas: 0,
+    comErro: 0,
+  };
+  const porMotivo = new Map<string, number>();
+
+  for (const [i, arquivo] of aptos.entries()) {
+    const t0 = Date.now();
+    const posicao = `[${i + 1}/${aptos.length}]`;
+    try {
+      const r = await processarArquivo(registro, arquivo, runDate);
+
+      totais.arquivosIngeridos += 1;
+      totais.linhasStaging += r.linhas;
+      totais.rejeitadas += r.rejeitadas;
+      totais.inseridas += r.inseridas;
+      totais.atualizadas += r.atualizadas;
+      for (const c of r.contagens) {
+        porMotivo.set(c.motivo, (porMotivo.get(c.motivo) ?? 0) + c.quantidade);
+      }
+
+      await registro.info(
+        `${posicao} ${arquivo.nome} gravado em ${duracaoBR(Date.now() - t0)} · ` +
+          `${numeroBR(r.linhas)} lidas · ${numeroBR(r.rejeitadas)} rejeitadas · ` +
+          `${numeroBR(r.inseridas)} inseridas · ${numeroBR(r.atualizadas)} atualizadas`,
+      );
+      if (r.recuperadas > 0) {
+        await registro.warn(
+          `${arquivo.nome}: ${numeroBR(r.recuperadas)} linhas com aspas fora do padrão lidas em modo tolerante`,
+        );
+      }
+      if (r.malformadas > 0) {
+        await registro.warn(
+          `${arquivo.nome}: ${numeroBR(r.malformadas)} linhas malformadas seguem como rejeição`,
+        );
+      }
+    } catch (erro) {
+      const msg = erro instanceof Error ? erro.message : String(erro);
+      totais.comErro += 1;
+      await registro.erro(
+        `${posicao} ${arquivo.nome} revertido: ${msg} · os demais arquivos seguem`,
+      );
+      await marcarArquivoComErro(registro.id, arquivo.idArquivo, msg);
+    }
+
+    // O painel acompanha o avanço arquivo a arquivo.
+    await registro.atualizar({
+      arquivos_ingeridos: totais.arquivosIngeridos,
+      linhas_staging: totais.linhasStaging,
+      linhas_gravadas: totais.inseridas + totais.atualizadas,
+      linhas_inseridas: totais.inseridas,
+      linhas_atualizadas: totais.atualizadas,
+      linhas_rejeitadas: totais.rejeitadas,
+    });
+  }
+
+  const gravadas = totais.inseridas + totais.atualizadas;
+  const sufixoErro =
+    totais.comErro > 0 ? ` · ${totais.comErro} arquivo(s) com erro` : '';
+
+  if (totais.arquivosIngeridos === 0) {
+    const detalhe = `nenhum dos ${aptos.length} arquivos pôde ser gravado`;
+    await registro.falharEtapa('Carga em staging', detalhe);
+    await registro.falharEtapa('Regras de qualidade', detalhe);
+    await registro.falharEtapa('Merge incremental', detalhe);
+    throw new Error(detalhe);
+  }
+
+  for (const [motivo, quantidade] of porMotivo) {
+    if (quantidade > 0) await registro.info(`  ${motivo}: ${numeroBR(quantidade)}`);
+  }
+  if (totais.rejeitadas > 0) {
+    await registro.warn(
+      `${numeroBR(totais.rejeitadas)} linhas reprovadas nas regras de qualidade · gravadas em ctl_rejeicao`,
+    );
+  }
+
+  await registro.concluirEtapa(
+    'Carga em staging',
+    `COPY → stg_isa_infopanel_preco · ${numeroBR(totais.linhasStaging)}${sufixoErro}`,
+  );
+  await registro.concluirEtapa(
+    'Regras de qualidade',
+    `${numeroBR(totais.rejeitadas)} rejeições → ctl_rejeicao`,
+  );
+  await registro.concluirEtapa(
+    'Merge incremental',
+    `UPSERT → fact_preco_coletado · ${numeroBR(gravadas)} · ` +
+      `${totais.arquivosIngeridos} de ${aptos.length} arquivos efetivados`,
+  );
+
+  // ── 9 · Auditoria e watermark ─────────────────────────────────────────────
+  const watermarkAnterior = await registro.etapa(
+    'Auditoria e watermark',
+    async () => {
+      const anterior = await emTransacao(async (cliente) => {
+        const r = await cliente.query<{ data_run: string }>(
+          'SELECT data_run FROM infoprice.ctl_watermark WHERE fonte = $1',
+          [config.coleta.fonte],
+        );
+        await cliente.query(
+          `INSERT INTO infoprice.ctl_watermark (fonte, data_run, id_execucao)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (fonte) DO UPDATE
+              SET data_run = GREATEST(infoprice.ctl_watermark.data_run, EXCLUDED.data_run),
+                  id_execucao = EXCLUDED.id_execucao,
+                  atualizado_em = now()`,
+          [config.coleta.fonte, runDate, registro.id],
+        );
+        return r.rows[0]?.data_run ?? null;
+      });
+      return { resultado: anterior, detalhe: `ctl_execucao · watermark ${runDate}` };
+    },
+  );
+
+  await registro.atualizar({
+    watermark_anterior: watermarkAnterior,
+    watermark_novo: runDate,
+  });
   await registro.info(
-    `watermark ctl_execucao.data_run = ${runDate} · arquivos marcados como ingeridos`,
+    `${numeroBR(gravadas)} linhas efetivadas · ${numeroBR(totais.inseridas)} inseridas · ` +
+      `${numeroBR(totais.atualizadas)} atualizadas · watermark ${runDate}`,
   );
 
   // ── 10 · Notificação ──────────────────────────────────────────────────────
@@ -550,6 +516,8 @@ async function rodarEtapas(
     totais.arquivosIngeridos < remotos.length ? 'parcial' : 'concluida';
   await registro.finalizar(status);
 
+  const percentual =
+    totais.linhasStaging > 0 ? (totais.rejeitadas / totais.linhasStaging) * 100 : 0;
   if (percentual > 0) {
     await registro.info(
       `rejeições em ${percentualBR(percentual)} das linhas do run`,
@@ -561,11 +529,125 @@ async function rodarEtapas(
     arquivosVistos: remotos.length,
     arquivosIngeridos: totais.arquivosIngeridos,
     linhasStaging: totais.linhasStaging,
-    linhasGravadas: totais.merge.gravadas,
-    linhasInseridas: totais.merge.inseridas,
-    linhasAtualizadas: totais.merge.atualizadas,
+    linhasGravadas: gravadas,
+    linhasInseridas: totais.inseridas,
+    linhasAtualizadas: totais.atualizadas,
     linhasRejeitadas: totais.rejeitadas,
   };
+}
+
+interface ResultadoArquivo {
+  linhas: number;
+  rejeitadas: number;
+  inseridas: number;
+  atualizadas: number;
+  recuperadas: number;
+  malformadas: number;
+  contagens: ContagemMotivo[];
+}
+
+/**
+ * Leva um arquivo do staging até a tabela final, numa transação só: limpa o
+ * staging do arquivo, carrega, aplica as regras, faz o merge e atualiza a
+ * trilha. Qualquer falha reverte apenas este arquivo.
+ */
+async function processarArquivo(
+  registro: RegistroExecucao,
+  arquivo: ArquivoLocal,
+  runDate: string,
+): Promise<ResultadoArquivo> {
+  // `longa`: COPY, regras e merge de um arquivo grande passam do teto de 30s
+  // aplicado às consultas de tela.
+  return emTransacao(async (cliente) => {
+    await limparStagingArquivo(cliente, arquivo.idArquivo);
+
+    const carga = await carregarArquivoEmStaging({
+      cliente,
+      idExecucao: registro.id,
+      idArquivo: arquivo.idArquivo,
+      arquivo: arquivo.nome,
+      caminhoLocal: arquivo.caminhoLocal,
+      runDate,
+      fonte: config.coleta.fonte,
+    });
+
+    // O cabeçalho já foi conferido; esta checagem só pega um arquivo que
+    // mudou de layout entre a validação e a carga.
+    const faltando = COLUNAS_OBRIGATORIAS.filter((c) => !carga.cabecalho.includes(c));
+    if (faltando.length > 0) {
+      throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
+    }
+
+    const contagens = await aplicarRegrasQualidade(
+      cliente,
+      registro.id,
+      arquivo.idArquivo,
+    );
+    const rejeitadas = contagens.reduce((s, c) => s + c.quantidade, 0);
+
+    const merge = await mergeIncremental(cliente, registro.id, arquivo.idArquivo);
+
+    await cliente.query(
+      `UPDATE infoprice.ctl_execucao_arquivo
+          SET linhas_lidas = $3,
+              linhas_gravadas = $4,
+              linhas_rejeitadas = $5,
+              linhas_inseridas = $6,
+              linhas_atualizadas = $7,
+              destino = 'stg → fact',
+              status = 'ingerido',
+              erro = NULL,
+              ingerido_em = now()
+        WHERE id_execucao = $1 AND id_arquivo = $2`,
+      [
+        registro.id,
+        arquivo.idArquivo,
+        carga.linhas,
+        merge.gravadas,
+        rejeitadas,
+        merge.inseridas,
+        merge.atualizadas,
+      ],
+    );
+
+    // O inventário guarda só a situação atual do arquivo na origem.
+    await cliente.query(
+      `UPDATE infoprice.ctl_arquivo
+          SET status = 'ingerido', erro = NULL, ingerido_em = now(), atualizado_em = now()
+        WHERE id = $1`,
+      [arquivo.idArquivo],
+    );
+
+    return {
+      linhas: carga.linhas,
+      rejeitadas,
+      inseridas: merge.inseridas,
+      atualizadas: merge.atualizadas,
+      recuperadas: carga.recuperadas,
+      malformadas: carga.malformadas,
+      contagens,
+    };
+  }, { longa: true });
+}
+
+/** Marca o arquivo com erro nesta execução e no inventário, fora de transação. */
+async function marcarArquivoComErro(
+  idExecucao: number,
+  idArquivo: number,
+  mensagem: string,
+): Promise<void> {
+  await pool.query(
+    `UPDATE infoprice.ctl_execucao_arquivo
+        SET status = 'erro', erro = $3
+      WHERE id_execucao = $1 AND id_arquivo = $2`,
+    [idExecucao, idArquivo, mensagem],
+  );
+  await pool.query(
+    `UPDATE infoprice.ctl_arquivo
+        SET status = 'erro', erro = $2, atualizado_em = now()
+      WHERE id = $1`,
+    [idArquivo, mensagem],
+  );
 }
 
 /**

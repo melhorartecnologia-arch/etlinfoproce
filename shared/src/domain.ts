@@ -65,6 +65,7 @@ export const MOTIVOS_REJEICAO = [
   'Linha malformada no arquivo',
   'GTIN inválido no dígito verificador',
   'Preço menor ou igual a zero',
+  'Preço acima do limite',
   'Loja ausente em dim_loja',
   'Data de coleta fora da janela do run',
   'Duplicidade na chave de conflito',

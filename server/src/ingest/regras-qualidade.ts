@@ -34,6 +34,14 @@ const REGRAS: Regra[] = [
     condicao: `infoprice.para_numero(s.preco) IS NULL OR infoprice.para_numero(s.preco) <= 0`,
   },
   {
+    // A tabela final guarda numeric(12,2). Um valor maior estouraria no merge e
+    // reverteria o arquivo inteiro por causa de uma linha.
+    motivo: 'Preço acima do limite',
+    tratamento: 'Aguardando correção na origem',
+    condicao: `abs(infoprice.para_numero(s.preco)) >= 10000000000
+               OR abs(infoprice.para_numero(s.preco_promocional)) >= 10000000000`,
+  },
+  {
     motivo: 'Loja ausente em dim_loja',
     tratamento: 'Cadastro de loja solicitado',
     condicao: `s.id_loja IS NULL
@@ -78,13 +86,18 @@ export interface ContagemMotivo {
 }
 
 /**
- * Aplica as regras e grava as reprovações em ctl_rejeicao.
- * Devolve a contagem por motivo, na ordem em que as regras rodaram.
+ * Aplica as regras às linhas de um arquivo e grava as reprovações em
+ * ctl_rejeicao. Devolve a contagem por motivo, na ordem em que as regras
+ * rodaram.
+ *
+ * A duplicidade é avaliada dentro do arquivo. A mesma chave repetida em outro
+ * arquivo do run não é rejeitada: o merge do arquivo seguinte a atualiza, e a
+ * última ocorrência prevalece do mesmo jeito.
  */
 export async function aplicarRegrasQualidade(
   cliente: Cliente,
   idExecucao: number,
-  runDate: string,
+  idArquivo: number,
 ): Promise<ContagemMotivo[]> {
   const contagens: ContagemMotivo[] = [];
 
@@ -103,9 +116,10 @@ export async function aplicarRegrasQualidade(
        SELECT s.id_execucao, s.id_arquivo, s.arquivo, s.numero_linha, $2, s.payload, $3
          FROM infoprice.stg_isa_infopanel_preco s
         WHERE s.id_execucao = $1
+          AND s.id_arquivo = $4
           AND (${regra.condicao})
           AND ${jaRejeitada}`,
-      [idExecucao, regra.motivo, regra.tratamento],
+      [idExecucao, regra.motivo, regra.tratamento, idArquivo],
     );
     contagens.push({ motivo: regra.motivo, quantidade: rowCount ?? 0 });
   }
@@ -117,10 +131,11 @@ export async function aplicarRegrasQualidade(
        SELECT s.*,
               row_number() OVER (
                 PARTITION BY s.gtin, s.id_loja, infoprice.para_data(s.data_coleta), s.fonte
-                ORDER BY s.numero_linha DESC, s.id_arquivo DESC
+                ORDER BY s.numero_linha DESC
               ) AS posicao
          FROM infoprice.stg_isa_infopanel_preco s
         WHERE s.id_execucao = $1
+          AND s.id_arquivo = $4
           AND ${jaRejeitada}
      )
      INSERT INTO infoprice.ctl_rejeicao
@@ -128,14 +143,13 @@ export async function aplicarRegrasQualidade(
      SELECT v.id_execucao, v.id_arquivo, v.arquivo, v.numero_linha, $2, v.payload, $3
        FROM validas v
       WHERE v.posicao > 1`,
-    [idExecucao, REGRA_DUPLICIDADE.motivo, REGRA_DUPLICIDADE.tratamento],
+    [idExecucao, REGRA_DUPLICIDADE.motivo, REGRA_DUPLICIDADE.tratamento, idArquivo],
   );
   contagens.push({
     motivo: REGRA_DUPLICIDADE.motivo,
     quantidade: dup ?? 0,
   });
 
-  void runDate;
   return contagens;
 }
 

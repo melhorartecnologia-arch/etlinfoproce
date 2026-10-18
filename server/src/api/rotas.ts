@@ -362,7 +362,7 @@ rotas.get(
           chave: 'Reexecução do mesmo run',
           valor: 'segura · substitui staging e reaplica upsert',
         },
-        { chave: 'Transação', valor: 'única · rollback total em qualquer falha' },
+        { chave: 'Transação', valor: 'uma por arquivo · falha reverte só o arquivo' },
         {
           chave: 'Retenção do arquivo local',
           valor: `${config.coleta.retencaoLocalDias} dias em ${config.coleta.areaTemporaria}`,

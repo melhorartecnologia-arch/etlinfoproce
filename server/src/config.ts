@@ -149,6 +149,17 @@ export const config = {
     retencaoOrigemDias: numero('RETENCAO_ORIGEM_DIAS', 5),
     retencaoLocalDias: numero('RETENCAO_LOCAL_DIAS', 30),
     colunasEsperadas: numero('COLUNAS_ESPERADAS', 42),
+    /**
+     * Nomes de coluna do arquivo que diferem dos usados aqui, no formato
+     * "coluna_interna=nome_no_arquivo" separados por vírgula
+     * (ex.: "gtin=cd_ean,preco=vl_preco"). Somam-se aos sinônimos embutidos.
+     */
+    mapaColunas: lista('MAPA_COLUNAS', ''),
+    /**
+     * Para arquivo SEM linha de cabeçalho: os nomes das colunas na ordem em
+     * que aparecem. Quando preenchido, a primeira linha do arquivo é dado.
+     */
+    colunasPosicao: lista('CSV_COLUNAS', ''),
     fonte: texto('FONTE', 'ISA-InfoPanel'),
     padraoPasta: /^run=(\d{4}-\d{2}-\d{2})$/,
   },
