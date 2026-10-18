@@ -60,8 +60,9 @@ export const ETAPAS_PROCESSO = [
 
 export type NomeEtapa = (typeof ETAPAS_PROCESSO)[number];
 
-/** Os seis motivos de rejeição aplicados sobre o staging. */
+/** Os motivos de rejeição aplicados sobre o staging. */
 export const MOTIVOS_REJEICAO = [
+  'Linha malformada no arquivo',
   'GTIN inválido no dígito verificador',
   'Preço menor ou igual a zero',
   'Loja ausente em dim_loja',

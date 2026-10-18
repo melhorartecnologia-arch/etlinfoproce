@@ -21,7 +21,6 @@
     "@infoprice/shared": "*",
     "cors": "^2.8.5",
     "cron-parser": "^4.9.0",
-    "csv-parse": "^5.6.0",
     "csv-stringify": "^6.5.2",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",

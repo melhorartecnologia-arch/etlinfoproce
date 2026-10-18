@@ -321,16 +321,45 @@ async function rodarEtapas(
     await limparStaging(cliente, runDate);
 
     let linhasStaging = 0;
+    const comErro: string[] = [];
     for (const arquivo of baixados) {
-      const carga = await carregarArquivoEmStaging({
-        cliente,
-        idExecucao: registro.id,
-        idArquivo: arquivo.idArquivo,
-        arquivo: arquivo.nome,
-        caminhoLocal: arquivo.caminhoLocal,
-        runDate,
-        fonte: config.coleta.fonte,
-      });
+      // Cada arquivo carrega sob um savepoint: se um deles falhar, só ele é
+      // desfeito, e os demais seguem para qualidade e merge. A execução fecha
+      // como parcial e a varredura tenta o arquivo de novo.
+      await cliente.query('SAVEPOINT carga_arquivo');
+      let carga: Awaited<ReturnType<typeof carregarArquivoEmStaging>>;
+      try {
+        carga = await carregarArquivoEmStaging({
+          cliente,
+          idExecucao: registro.id,
+          idArquivo: arquivo.idArquivo,
+          arquivo: arquivo.nome,
+          caminhoLocal: arquivo.caminhoLocal,
+          runDate,
+          fonte: config.coleta.fonte,
+        });
+        await cliente.query('RELEASE SAVEPOINT carga_arquivo');
+      } catch (erro) {
+        await cliente.query('ROLLBACK TO SAVEPOINT carga_arquivo');
+        const msg = erro instanceof Error ? erro.message : String(erro);
+        comErro.push(arquivo.nome);
+        await registro.erro(
+          `COPY ${arquivo.nome} desfeito: ${msg} · os demais arquivos seguem`,
+        );
+        await pool.query(
+          `UPDATE infoprice.ctl_execucao_arquivo
+              SET status = 'erro', erro = $3
+            WHERE id_execucao = $1 AND id_arquivo = $2`,
+          [registro.id, arquivo.idArquivo, msg],
+        );
+        await pool.query(
+          `UPDATE infoprice.ctl_arquivo
+              SET status = 'erro', erro = $2, atualizado_em = now()
+            WHERE id = $1`,
+          [arquivo.idArquivo, msg],
+        );
+        continue;
+      }
 
       colunasVistas = Math.max(colunasVistas, carga.colunas);
       const faltando = COLUNAS_OBRIGATORIAS.filter(
@@ -350,6 +379,22 @@ async function rodarEtapas(
       await registro.info(
         `COPY ${arquivo.nome} → ${numeroBR(carga.linhas)} linhas`,
       );
+      if (carga.recuperadas > 0) {
+        await registro.warn(
+          `${arquivo.nome}: ${numeroBR(carga.recuperadas)} linhas com aspas fora do padrão lidas em modo tolerante`,
+        );
+      }
+      if (carga.malformadas > 0) {
+        await registro.warn(
+          `${arquivo.nome}: ${numeroBR(carga.malformadas)} linhas malformadas seguem como rejeição`,
+        );
+      }
+    }
+
+    if (comErro.length > 0 && comErro.length === baixados.length) {
+      throw new Error(
+        `nenhum arquivo pôde ser carregado (${comErro.length} com erro)`,
+      );
     }
 
     if (divergencias.length > 0) {
@@ -367,7 +412,8 @@ async function rodarEtapas(
     );
     await registro.concluirEtapa(
       'Carga em staging',
-      `COPY → stg_isa_infopanel_preco · ${numeroBR(linhasStaging)}`,
+      `COPY → stg_isa_infopanel_preco · ${numeroBR(linhasStaging)}` +
+        (comErro.length > 0 ? ` · ${comErro.length} arquivo(s) com erro` : ''),
     );
 
     // 7 · Regras de qualidade

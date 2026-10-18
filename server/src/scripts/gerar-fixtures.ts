@@ -201,10 +201,11 @@ function* gerarLinhas(
     const promocao = rnd() < 0.18;
 
     // ── Defeitos semeados, um por regra de qualidade ──────────────────────
-    // No total ~0,29% das linhas, abaixo do limite de 0,5% que abre incidente:
+    // No total ~0,32% das linhas, abaixo do limite de 0,5% que abre incidente:
     // assim o dia normal fica limpo e a regra de rejeições só dispara quando
     // um arquivo realmente vem pior que o habitual.
     const sorteio = rnd();
+    let descricaoBruta: string | null = null;
     if (sorteio < 0.001) {
       gtin = '78912345678999'; // dígito verificador inválido
     } else if (sorteio < 0.0016) {
@@ -216,6 +217,14 @@ function* gerarLinhas(
     } else if (sorteio < 0.0029) {
       descricao = descricao.replace('É', '\\xC9'); // encoding quebrado
       if (!descricao.includes('\\x')) descricao = `CAF\\xC9 ${descricao}`;
+    } else if (sorteio < 0.0032) {
+      // Linha que não tem como ser lida: aspa solta seguida de texto e de um
+      // delimitador a mais. Vira rejeição sem interromper o arquivo.
+      descricaoBruta = `"${descricao}"x;sobra`;
+    } else if (sorteio < 0.0034) {
+      // Não é defeito: aspa escapada com barra, como o Spark grava por padrão.
+      // O leitor precisa aceitar a linha normalmente.
+      descricaoBruta = `"${descricao} TV 50\\" LED"`;
     }
 
     const precoPromo = promocao ? (Number(preco) * 0.82).toFixed(2) : '';
@@ -231,7 +240,9 @@ function* gerarLinhas(
       (0.9 + rnd() * 0.1).toFixed(2), '', 'v1',
     ];
 
-    yield linha.map(campo).join(';') + '\n';
+    const celulas = linha.map(campo);
+    if (descricaoBruta) celulas[1] = descricaoBruta;
+    yield celulas.join(';') + '\n';
   }
 }
 

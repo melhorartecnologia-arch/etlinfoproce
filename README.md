@@ -80,7 +80,7 @@ A coleta roda em dez etapas, as mesmas que aparecem no painel:
 | 4 | Verificação de integridade | SHA-256 do arquivo e do conteúdo descompactado |
 | 5 | Validação de schema | confere as colunas obrigatórias no cabeçalho |
 | 6 | Carga em staging | `COPY` em `stg_isa_infopanel_preco`, tudo como texto |
-| 7 | Regras de qualidade | seis regras; a linha reprovada vai para `ctl_rejeicao` com o payload original |
+| 7 | Regras de qualidade | sete regras; a linha reprovada vai para `ctl_rejeicao` com o payload original |
 | 8 | Merge incremental | `UPSERT` em `fact_preco_coletado` pela chave de conflito |
 | 9 | Auditoria e watermark | fecha `ctl_execucao` e avança `ctl_watermark` |
 | 10 | Notificação | resumo no painel e por e-mail |
@@ -93,17 +93,31 @@ porém, é gravado fora da transação e sobrevive para explicar o motivo.
 apagado e recarregado, e o `UPSERT` só conta como atualização a linha cujo preço
 mudou de fato. Reprocessar um dia sem alteração na origem grava zero linhas.
 
-### As seis regras de qualidade
+### As sete regras de qualidade
 
 Rodam em ordem sobre o staging; a primeira que pega a linha é a dona da
 rejeição, então uma linha nunca aparece com dois motivos.
 
-1. GTIN inválido no dígito verificador (módulo 10 GS1, em `infoprice.gtin_valido`)
-2. Preço menor ou igual a zero
-3. Loja ausente em `dim_loja`
-4. Data de coleta fora da janela do run
-5. Duplicidade na chave de conflito — mantém a última ocorrência
-6. Caractere inválido na descrição (encoding quebrado)
+1. Linha malformada no arquivo (não pôde ser separada em colunas)
+2. GTIN inválido no dígito verificador (módulo 10 GS1, em `infoprice.gtin_valido`)
+3. Preço menor ou igual a zero
+4. Loja ausente em `dim_loja`
+5. Data de coleta fora da janela do run
+6. Duplicidade na chave de conflito — mantém a última ocorrência
+7. Caractere inválido na descrição (encoding quebrado)
+
+### Leitura tolerante do CSV
+
+Uma linha defeituosa nunca interrompe a execução. O leitor aceita os dois
+escapes de aspas que aparecem na prática — `""` e `\"`, o padrão do Spark, que
+gera os arquivos `part-*.csv.gz` — e campos entre aspas com quebra de linha.
+Uma aspa solta é lida como texto quando a linha ainda tem o número certo de
+colunas; quando não tem, a linha entra no staging com o texto original e cai
+na regra 1. O log da execução conta as linhas de cada caso, por arquivo.
+
+Se a carga de um arquivo falhar por outro motivo, só ele é desfeito (cada
+arquivo carrega sob um savepoint): os demais seguem, a execução fecha como
+parcial e a varredura tenta o arquivo de novo.
 
 ### Rastreabilidade
 
@@ -135,9 +149,9 @@ npm run gerar-fixtures --workspace @infoprice/server -- --dias 6 --arquivos 4 --
 npm run ingest --workspace @infoprice/server -- --run 2026-08-25
 ```
 
-O gerador semeia defeitos de propósito (~0,29% das linhas, abaixo do limite de
+O gerador semeia defeitos de propósito (~0,32% das linhas, abaixo do limite de
 0,5% que abre incidente), um por regra de qualidade, para a tela de rejeições
-ter o que mostrar. `--semente 7` regera o mesmo dia com outros preços, o que
+ter o que mostrar — e também aspas escapadas com barra, que devem ser aceitas. `--semente 7` regera o mesmo dia com outros preços, o que
 demonstra o caminho de atualização do merge.
 
 ### Contra o SFTP real

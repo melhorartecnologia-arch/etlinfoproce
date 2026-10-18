@@ -1,7 +1,7 @@
 import type { Cliente } from '../db/pool.js';
 
 /**
- * As seis regras de qualidade, aplicadas em conjunto sobre o staging.
+ * As regras de qualidade, aplicadas em conjunto sobre o staging.
  *
  * Cada regra é uma consulta que seleciona as linhas reprovadas e as grava em
  * ctl_rejeicao com o payload original. Rodam em ordem: a primeira que pega uma
@@ -16,6 +16,13 @@ interface Regra {
 }
 
 const REGRAS: Regra[] = [
+  {
+    // Primeira de propósito: a linha que não pôde ser lida chega com as colunas
+    // vazias, e qualquer regra seguinte a pegaria com o motivo errado.
+    motivo: 'Linha malformada no arquivo',
+    tratamento: 'Aguardando correção na origem',
+    condicao: `s.erro_leitura IS NOT NULL`,
+  },
   {
     motivo: 'GTIN inválido no dígito verificador',
     tratamento: 'Aguardando correção na origem',

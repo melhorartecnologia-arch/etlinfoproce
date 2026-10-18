@@ -25,6 +25,7 @@ const COLUNAS_STAGING = [
   'data_coleta',
   'fonte',
   'payload',
+  'erro_leitura',
 ] as const;
 
 export interface ParametrosCarga {
@@ -41,6 +42,10 @@ export interface ResultadoCarga {
   linhas: number;
   colunas: number;
   cabecalho: string[];
+  /** Linhas com aspas fora do padrão que ainda assim foram lidas. */
+  recuperadas: number;
+  /** Linhas que não puderam ser lidas; entram marcadas com erro_leitura. */
+  malformadas: number;
 }
 
 /**
@@ -106,6 +111,8 @@ export async function carregarArquivoEmStaging(
           c.data_coleta ?? '',
           p.fonte,
           linha.payload,
+          // null sai sem aspas, e o COPY em CSV lê campo vazio sem aspas como NULL.
+          linha.erro ?? null,
         ]);
         if (!podeContinuar) await esperarVazao();
       }
@@ -118,6 +125,8 @@ export async function carregarArquivoEmStaging(
       linhas: resultado.linhas,
       colunas: resultado.totalColunas,
       cabecalho: resultado.cabecalho,
+      recuperadas: resultado.recuperadas,
+      malformadas: resultado.malformadas,
     };
   } catch (erro) {
     gerador.destroy();

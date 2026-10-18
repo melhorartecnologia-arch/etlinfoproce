@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import zlib from 'node:zlib';
-import { parse } from 'csv-parse';
+import { StringDecoder } from 'node:string_decoder';
 
 /**
  * Colunas que o pipeline usa do arquivo da InfoPrice. O arquivo traz 42
@@ -44,6 +44,19 @@ const SINONIMOS: Record<string, string> = {
   data_pesquisa: 'data_coleta',
 };
 
+/**
+ * Quantas linhas físicas um campo entre aspas pode atravessar. Acima disso a
+ * aspa de abertura é tratada como defeito da linha, e não como início de um
+ * texto com quebras — sem esse teto, uma única aspa solta engoliria o resto
+ * do arquivo como se fosse um campo só.
+ */
+const MAX_LINHAS_POR_REGISTRO = 50;
+
+/** Teto do payload guardado para uma linha que não pôde ser lida. */
+const MAX_PAYLOAD_MALFORMADO = 10_000;
+
+const DELIMITADORES = [';', ',', '\t'] as const;
+
 export function normalizarCabecalho(nome: string): string {
   const limpo = nome
     .trim()
@@ -59,12 +72,161 @@ export interface LinhaLida {
   numeroLinha: number;
   campos: Record<string, string>;
   payload: string;
+  /**
+   * Preenchido quando a linha não pôde ser separada em colunas. Ela segue para
+   * o staging assim mesmo, com o texto original no payload, e a primeira regra
+   * de qualidade a rejeita — um defeito de uma linha não derruba o arquivo.
+   */
+  erro?: string;
 }
 
 export interface ResultadoLeitura {
   cabecalho: string[];
   totalColunas: number;
   linhas: number;
+  /** Linhas com aspas fora do padrão que ainda assim foram lidas. */
+  recuperadas: number;
+  /** Linhas que não puderam ser lidas e seguem como rejeição. */
+  malformadas: number;
+}
+
+interface Registro {
+  campos: string[];
+  /** O texto terminou fora de aspas: o registro está inteiro. */
+  completo: boolean;
+  /** Apareceu aspa que nem fecha o campo nem está escapada. */
+  irregular: boolean;
+}
+
+/** Só espaço (e tab, quando não é o delimitador) até o delimitador ou o fim? */
+function fechaCampo(texto: string, pos: number, delim: string): boolean {
+  let i = pos;
+  while (i < texto.length && texto[i] !== delim && (texto[i] === ' ' || texto[i] === '\t')) {
+    i += 1;
+  }
+  return i >= texto.length || texto[i] === delim;
+}
+
+/**
+ * Separa um registro em campos, de forma tolerante.
+ *
+ * Dentro de aspas aceita os dois escapes que aparecem na prática: `""` (RFC
+ * 4180) e `\"` (o padrão do Spark, que gera os arquivos da InfoPrice). Uma aspa
+ * que não fecha o campo — seguida de texto, e não do delimitador — vira parte
+ * do valor e marca o registro como irregular, em vez de abortar a leitura.
+ */
+function analisarRegistro(texto: string, delim: string): Registro {
+  const campos: string[] = [];
+  let irregular = false;
+  let i = 0;
+  const n = texto.length;
+
+  for (;;) {
+    let j = i;
+    while (j < n && texto[j] !== delim && (texto[j] === ' ' || texto[j] === '\t')) j += 1;
+
+    if (j < n && texto[j] === '"') {
+      let valor = '';
+      let k = j + 1;
+      let fechado = false;
+
+      while (k < n) {
+        const c = texto[k]!;
+        if (c === '\\' && texto[k + 1] === '"') {
+          // `\"` é escape, a menos que essa aspa feche o campo: aí a barra é
+          // literal (um valor que termina em barra, como "C:\").
+          if (!fechaCampo(texto, k + 2, delim)) {
+            valor += '"';
+            k += 2;
+            continue;
+          }
+          valor += '\\';
+          k += 1;
+          continue;
+        }
+        if (c === '"') {
+          if (texto[k + 1] === '"') {
+            valor += '"';
+            k += 2;
+            continue;
+          }
+          if (fechaCampo(texto, k + 1, delim)) {
+            fechado = true;
+            k += 1;
+            break;
+          }
+          irregular = true;
+          valor += '"';
+          k += 1;
+          continue;
+        }
+        valor += c;
+        k += 1;
+      }
+
+      if (!fechado) return { campos, completo: false, irregular };
+
+      campos.push(valor);
+      while (k < n && texto[k] !== delim) k += 1;
+      if (k >= n) return { campos, completo: true, irregular };
+      i = k + 1;
+    } else {
+      const fim = texto.indexOf(delim, i);
+      campos.push((fim === -1 ? texto.slice(i) : texto.slice(i, fim)).trim());
+      if (fim === -1) return { campos, completo: true, irregular };
+      i = fim + 1;
+    }
+  }
+}
+
+/** Remove as aspas externas de um campo e desfaz os escapes. */
+function desaspar(campo: string): string {
+  const t = campo.trim();
+  if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) {
+    return t.slice(1, -1).replace(/""/g, '"').replace(/\\"/g, '"');
+  }
+  return t;
+}
+
+/** O delimitador mais frequente fora de aspas no cabeçalho; `;` se nenhum. */
+function detectarDelimitador(cabecalho: string): string {
+  const contagem = new Map<string, number>(DELIMITADORES.map((d) => [d, 0]));
+  let entreAspas = false;
+  for (const c of cabecalho) {
+    if (c === '"') entreAspas = !entreAspas;
+    else if (!entreAspas && contagem.has(c)) contagem.set(c, contagem.get(c)! + 1);
+  }
+  let melhor: string = ';';
+  for (const [d, q] of contagem) if (q > contagem.get(melhor)!) melhor = d;
+  return melhor;
+}
+
+/**
+ * Linhas físicas do arquivo, sem o terminador. O PostgreSQL recusa o byte nulo
+ * num campo texto — derrubaria o COPY do arquivo inteiro —, então ele é trocado
+ * pelo caractere de substituição, que a regra de encoding já reconhece.
+ */
+async function* linhasFisicas(
+  entrada: NodeJS.ReadableStream,
+): AsyncGenerator<string> {
+  const decodificador = new StringDecoder('utf8');
+  let resto = '';
+  const limpar = (l: string) =>
+    (l.endsWith('\r') ? l.slice(0, -1) : l).replace(/\u0000/g, '\uFFFD');
+
+  for await (const pedaco of entrada) {
+    resto += decodificador.write(pedaco as Buffer);
+    let inicio = 0;
+    let fim: number;
+    while ((fim = resto.indexOf('\n', inicio)) !== -1) {
+      yield limpar(resto.slice(inicio, fim));
+      inicio = fim + 1;
+    }
+    resto = resto.slice(inicio);
+  }
+
+  resto += decodificador.end();
+  if (resto.length > 0) yield limpar(resto);
 }
 
 /**
@@ -73,6 +235,10 @@ export interface ResultadoLeitura {
  * O arquivo é processado em streaming: um arquivo de 160 MB comprimido nunca
  * é materializado inteiro em memória. O `for await` aplica contrapressão, então
  * a leitura anda no ritmo do COPY para o banco.
+ *
+ * A leitura não aborta por causa de uma linha: aspas fora do padrão são
+ * interpretadas de forma tolerante e, quando a linha não tem como ser separada
+ * em colunas, ela segue marcada com `erro` para virar rejeição rastreável.
  */
 export async function lerCsv(
   caminho: string,
@@ -83,48 +249,120 @@ export async function lerCsv(
   const bytes = caminho.endsWith('.gz')
     ? entrada.pipe(zlib.createGunzip())
     : entrada;
-
-  const analisador = bytes.pipe(
-    parse({
-      bom: true,
-      delimiter: [';', ',', '\t'],
-      relax_column_count: true,
-      relax_quotes: true,
-      skip_empty_lines: true,
-      trim: true,
-    }),
-  );
+  // O pipe não repassa erros: sem isto, um gzip corrompido deixaria a
+  // leitura esperando para sempre em vez de falhar.
+  entrada.on('error', (erro) => bytes.destroy(erro));
 
   let cabecalho: string[] = [];
+  let delim = ';';
   let numeroLinha = 0;
+  let recuperadas = 0;
+  let malformadas = 0;
   let lote: LinhaLida[] = [];
+  /** Linhas físicas ainda não consumidas por um registro. */
+  const pendentes: string[] = [];
 
-  try {
-    for await (const registro of analisador as AsyncIterable<string[]>) {
+  const emitir = async (valores: string[], payload: string, erro?: string) => {
+    numeroLinha += 1;
+    const campos: Record<string, string> = {};
+    if (!erro) {
+      cabecalho.forEach((coluna, i) => {
+        if (coluna) campos[coluna] = valores[i] ?? '';
+      });
+    }
+    // O payload guarda a linha como veio, para a tela de rejeições poder
+    // mostrar o original.
+    lote.push({ numeroLinha, campos, payload, ...(erro ? { erro } : {}) });
+    if (lote.length >= tamanhoLote) {
+      await aoLote(lote);
+      lote = [];
+    }
+  };
+
+  /** Consome o que já dá para decidir; `fim` indica que o arquivo acabou. */
+  const consumir = async (fim: boolean) => {
+    while (pendentes.length > 0) {
+      const primeira = pendentes[0]!;
+
       if (cabecalho.length === 0) {
-        cabecalho = registro.map(normalizarCabecalho);
+        pendentes.shift();
+        const semBom = primeira.replace(/^\uFEFF/, '');
+        if (semBom.trim() === '') continue;
+        delim = detectarDelimitador(semBom);
+        cabecalho = analisarRegistro(semBom, delim).campos.map(normalizarCabecalho);
         continue;
       }
 
-      numeroLinha += 1;
-      const campos: Record<string, string> = {};
-      cabecalho.forEach((coluna, i) => {
-        if (coluna) campos[coluna] = registro[i] ?? '';
-      });
+      if (primeira.trim() === '') {
+        pendentes.shift();
+        continue;
+      }
 
-      lote.push({
-        numeroLinha,
-        campos,
-        // O payload guarda a linha como veio, para a tela de rejeições poder
-        // mostrar o original.
-        payload: registro.join(';'),
-      });
+      // Caminho rápido: sem aspas não há o que interpretar.
+      if (!primeira.includes('"')) {
+        pendentes.shift();
+        const valores = primeira.split(delim).map((v) => v.trim());
+        await emitir(valores, valores.join(';'));
+        continue;
+      }
 
-      if (lote.length >= tamanhoLote) {
-        await aoLote(lote);
-        lote = [];
+      // Um campo entre aspas pode conter quebra de linha: junta linhas até o
+      // registro fechar, dentro do teto.
+      let registro: Registro | null = null;
+      let usadas = 0;
+      const limite = Math.min(pendentes.length, MAX_LINHAS_POR_REGISTRO);
+      for (let k = 1; k <= limite; k += 1) {
+        const r = analisarRegistro(pendentes.slice(0, k).join('\n'), delim);
+        if (r.completo) {
+          registro = r;
+          usadas = k;
+          break;
+        }
+      }
+
+      if (!registro && !fim && pendentes.length < MAX_LINHAS_POR_REGISTRO) {
+        return; // espera as próximas linhas
+      }
+
+      // Com aspa irregular, só vale o registro de uma linha só e com a
+      // contagem de colunas certa: atravessando linhas, a aspa solta pode ter
+      // casado com a de um registro vizinho e fundido os dois.
+      if (
+        registro &&
+        (!registro.irregular ||
+          (usadas === 1 && registro.campos.length === cabecalho.length))
+      ) {
+        pendentes.splice(0, usadas);
+        if (registro.irregular) recuperadas += 1;
+        await emitir(registro.campos, registro.campos.join(';'));
+        continue;
+      }
+
+      // Não fechou, ou fechou com aspas irregulares e a contagem de colunas
+      // não confere: a primeira linha é avaliada sozinha, com as aspas como
+      // texto, e as seguintes voltam a ser lidas normalmente.
+      pendentes.shift();
+      const valores = primeira.split(delim).map(desaspar);
+      if (valores.length === cabecalho.length) {
+        recuperadas += 1;
+        await emitir(valores, valores.join(';'));
+      } else {
+        malformadas += 1;
+        await emitir(
+          [],
+          primeira.slice(0, MAX_PAYLOAD_MALFORMADO),
+          `aspas desbalanceadas · ${valores.length} de ${cabecalho.length} colunas`,
+        );
       }
     }
+  };
+
+  try {
+    for await (const linha of linhasFisicas(bytes)) {
+      pendentes.push(linha);
+      await consumir(false);
+    }
+    await consumir(true);
 
     if (lote.length > 0) await aoLote(lote);
   } finally {
@@ -136,5 +374,7 @@ export async function lerCsv(
     cabecalho,
     totalColunas: cabecalho.length,
     linhas: numeroLinha,
+    recuperadas,
+    malformadas,
   };
 }
