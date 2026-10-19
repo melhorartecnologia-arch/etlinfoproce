@@ -13,6 +13,7 @@ import type {
 } from '@infoprice/shared';
 import { config } from '../config.js';
 import { consultar, consultarUm } from '../db/pool.js';
+import { COLUNAS_ORIGEM } from '../ingest/colunas-origem.js';
 import { diferencaDias, dataLocal } from '../util/tempo.js';
 
 /** Colunas de ctl_execucao já com os nomes que a API expõe. */
@@ -449,6 +450,8 @@ export interface FiltrosPreco {
   busca?: string;
   tipo?: string;
   limite: number;
+  /** Traz também todas as colunas do arquivo em `extras` (exportação). */
+  completo?: boolean;
 }
 
 export async function consultarPrecos(
@@ -492,6 +495,7 @@ export async function consultarPrecos(
             f.id_loja                AS "idLoja",
             f.rede,
             f.uf,
+            f.municipio,
             f.preco::text,
             f.preco_promocional::text AS "precoPromocional",
             f.tipo_preco             AS "tipoPreco",
@@ -503,6 +507,7 @@ export async function consultarPrecos(
             COALESCE(a.nome, '—')    AS arquivo,
             f.criado_em              AS "criadoEm",
             f.atualizado_em          AS "atualizadoEm"
+            ${f.completo ? `, jsonb_build_object(${COLUNAS_ORIGEM.map((c) => `'${c.nome}', f.${c.nome}::text`).join(', ')}) AS extras` : ''}
        FROM infoprice.fact_preco_coletado f
        LEFT JOIN infoprice.ctl_arquivo a ON a.id = f.id_arquivo
        ${onde}

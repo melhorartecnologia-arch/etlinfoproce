@@ -3,6 +3,7 @@ import { stringify } from 'csv-stringify';
 import copiar from 'pg-copy-streams';
 import type { Cliente } from '../db/pool.js';
 import { lerCsv } from './leitor-csv.js';
+import { COLUNAS_ORIGEM } from './colunas-origem.js';
 
 const { from: copyFrom } = copiar;
 
@@ -26,7 +27,9 @@ const COLUNAS_STAGING = [
   'fonte',
   'payload',
   'erro_leitura',
-] as const;
+  // As demais colunas do arquivo, como texto; o merge converte cada uma.
+  ...COLUNAS_ORIGEM.map((c) => c.nome),
+];
 
 export interface ParametrosCarga {
   cliente: Cliente;
@@ -116,6 +119,7 @@ export async function carregarArquivoEmStaging(
           linha.payload,
           // null sai sem aspas, e o COPY em CSV lê campo vazio sem aspas como NULL.
           linha.erro ?? null,
+          ...COLUNAS_ORIGEM.map((c) => linha.brutos[c.origem] ?? ''),
         ]);
         if (!podeContinuar) await esperarVazao();
       }

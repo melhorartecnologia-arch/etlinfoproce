@@ -30,6 +30,7 @@ import {
 import { executarColeta } from '../ingest/pipeline.js';
 import { pedirCancelamento } from '../ingest/cancelamento.js';
 import { listarRuns, tipoDaCarga } from './runs.js';
+import { COLUNAS_ORIGEM } from '../ingest/colunas-origem.js';
 import {
   arquivosComRejeicao,
   detalheRejeicao,
@@ -1317,18 +1318,23 @@ rotas.get(
       busca: (req.query.busca as string) || undefined,
       tipo: (req.query.tipo as string) || undefined,
       limite: Math.min(inteiro(req.query.limite, 10_000), 100_000),
+      completo: true,
     });
 
+    // Todas as colunas do arquivo, além das usadas pelas regras e da origem
+    // de cada linha.
+    const extras = COLUNAS_ORIGEM.map((c) => c.nome);
     enviarCsv(
       res,
       `precos-${(req.query.data as string) || dataLocal()}.csv`,
       [
-        'gtin', 'descricao', 'loja', 'rede', 'uf', 'preco', 'preco_promocional',
-        'tipo', 'data_coleta', 'execucao', 'arquivo', 'linha_no_arquivo',
+        'gtin', 'descricao', 'id_loja', 'rede', 'uf', 'municipio', 'preco', 'preco_promocional',
+        'tipo', 'data_coleta', ...extras, 'execucao', 'arquivo', 'linha_no_arquivo',
       ],
       linhas.map((p) => [
-        p.gtin, p.descricao, p.idLoja, p.rede ?? '', p.uf ?? '', p.preco,
+        p.gtin, p.descricao, p.idLoja, p.rede ?? '', p.uf ?? '', p.municipio ?? '', p.preco,
         p.precoPromocional ?? '', p.tipoPreco, p.dataColeta,
+        ...extras.map((n) => p.extras?.[n] ?? ''),
         `#${p.idExecucao}`, p.arquivo, p.numeroLinha,
       ]),
     );

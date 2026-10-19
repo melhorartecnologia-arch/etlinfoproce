@@ -116,6 +116,8 @@ export interface InfoCabecalho {
   delimitador: string;
   /** Nomes já normalizados e mapeados para o vocabulário interno. */
   colunas: string[];
+  /** Nomes como estão no arquivo, só normalizados (sem sinônimos). */
+  nomesOriginais: string[];
   /** A primeira linha como veio, para o diagnóstico. */
   primeiraLinha: string;
   /** Os nomes vieram de CSV_COLUNAS: a primeira linha do arquivo é dado. */
@@ -137,11 +139,11 @@ export function analisarCabecalho(linha: string): InfoCabecalho {
   const delimitador = detectarDelimitador(primeiraLinha);
   const campos = analisarRegistro(primeiraLinha, delimitador).campos;
   const semCabecalho = config.coleta.colunasPosicao.length > 0;
+  const nomes = semCabecalho ? config.coleta.colunasPosicao : campos;
   return {
     delimitador,
-    colunas: (semCabecalho ? config.coleta.colunasPosicao : campos).map(
-      normalizarCabecalho,
-    ),
+    colunas: nomes.map(normalizarCabecalho),
+    nomesOriginais: nomes.map(limparNome),
     primeiraLinha,
     semCabecalho,
     pareceDado: campos.some((c) => PADROES_DADO.some((p) => p.test(c.trim()))),
@@ -291,6 +293,12 @@ export async function primeirasLinhas(caminho: string, quantidade: number): Prom
 export interface LinhaLida {
   numeroLinha: number;
   campos: Record<string, string>;
+  /**
+   * Cada coluna do arquivo pelo nome original normalizado, sem sinônimos nem
+   * campos derivados (\N vira vazio). Alimenta as colunas do fato que
+   * espelham o arquivo — ver colunas-origem.ts.
+   */
+  brutos: Record<string, string>;
   payload: string;
   /**
    * Preenchido quando a linha não pôde ser separada em colunas. Ela segue para
@@ -474,6 +482,7 @@ export async function lerCsv(
   entrada.on('error', (erro) => bytes.destroy(erro));
 
   let cabecalho: string[] = [];
+  let nomesOriginais: string[] = [];
   let delim = ';';
   let numeroLinha = 0;
   let recuperadas = 0;
@@ -485,10 +494,17 @@ export async function lerCsv(
   const emitir = async (valores: string[], payload: string, erro?: string) => {
     numeroLinha += 1;
     const campos = erro ? {} : montarCampos(cabecalho, valores);
+    const brutos: Record<string, string> = {};
+    if (!erro) {
+      nomesOriginais.forEach((nome, i) => {
+        const v = valores[i] ?? '';
+        if (nome && !brutos[nome]) brutos[nome] = v === NULO ? '' : v;
+      });
+    }
     // O payload guarda a linha exatamente como veio — com o delimitador e as
     // aspas originais —, para a tela de rejeições mostrar o original e
     // reinterpretá-lo coluna a coluna.
-    lote.push({ numeroLinha, campos, payload, ...(erro ? { erro } : {}) });
+    lote.push({ numeroLinha, campos, brutos, payload, ...(erro ? { erro } : {}) });
     if (lote.length >= tamanhoLote) {
       await aoLote(lote);
       lote = [];
@@ -508,6 +524,7 @@ export async function lerCsv(
         const info = analisarCabecalho(primeira);
         delim = info.delimitador;
         cabecalho = info.colunas;
+        nomesOriginais = info.nomesOriginais;
         if (info.semCabecalho) {
           // A primeira linha é dado: fica para ser lida como registro.
           pendentes[0] = info.primeiraLinha;

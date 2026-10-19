@@ -184,12 +184,18 @@ export interface Agendamento {
 }
 
 export interface Preco {
+  /**
+   * As demais colunas do arquivo, como texto — só na exportação completa
+   * (ver COLUNAS_ORIGEM no servidor).
+   */
+  extras?: Record<string, string | null>;
   id: string;
   gtin: string;
   descricao: string;
   idLoja: string;
   rede: string | null;
   uf: string | null;
+  municipio?: string | null;
   preco: string;
   precoPromocional: string | null;
   tipoPreco: string;

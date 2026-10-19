@@ -1,4 +1,10 @@
 import type { Cliente } from '../db/pool.js';
+import { COLUNAS_ORIGEM, expressaoConversao } from './colunas-origem.js';
+
+/** As colunas do arquivo além das que as regras usam, já convertidas. */
+const EXTRAS = COLUNAS_ORIGEM.map((c) => c.nome);
+const EXTRAS_SELECT = COLUNAS_ORIGEM.map((c) => `${expressaoConversao(c)} AS ${c.nome}`).join(',\n              ');
+const EXTRAS_SET = EXTRAS.map((n) => `${n} = EXCLUDED.${n}`).join(',\n              ');
 
 export interface ContagemArquivo {
   idArquivo: number;
@@ -20,13 +26,13 @@ export interface ResultadoMerge {
  * diferente do que o pipeline realmente roda.
  */
 export const SQL_PERSISTENCIA = `INSERT INTO infoprice.fact_preco_coletado AS f
-SELECT * FROM infoprice.stg_isa_infopanel_preco
+SELECT * FROM infoprice.stg_isa_infopanel_preco   -- todas as colunas do arquivo
 WHERE run_date = DATE '{run}' AND id_arquivo = :arquivo  -- um arquivo por transação
 ON CONFLICT (gtin, id_loja, data_coleta, fonte)
-DO UPDATE SET preco = EXCLUDED.preco,
+DO UPDATE SET preco = EXCLUDED.preco, …,           -- e as demais colunas
               id_execucao = EXCLUDED.id_execucao,
               atualizado_em = now()
-WHERE f.preco IS DISTINCT FROM EXCLUDED.preco;`;
+WHERE (f.preco, …) IS DISTINCT FROM (EXCLUDED.preco, …);  -- só se algo mudou`;
 
 /**
  * Cria as partições mensais necessárias para as datas que serão gravadas.
@@ -103,6 +109,7 @@ export async function mergeIncremental(
               infoprice.para_numero(s.preco)          AS preco,
               infoprice.para_numero(s.preco_promocional) AS preco_promocional,
               COALESCE(NULLIF(btrim(s.tipo_preco), ''), 'Regular') AS tipo_preco,
+              ${EXTRAS_SELECT},
               s.id_execucao,
               s.id_arquivo,
               s.numero_linha
@@ -119,10 +126,12 @@ export async function mergeIncremental(
      gravadas AS (
        INSERT INTO infoprice.fact_preco_coletado AS f (
          gtin, id_loja, data_coleta, fonte, descricao, rede, uf, municipio,
-         preco, preco_promocional, tipo_preco, id_execucao, id_arquivo, numero_linha
+         preco, preco_promocional, tipo_preco, ${EXTRAS.join(', ')},
+         id_execucao, id_arquivo, numero_linha
        )
        SELECT gtin, id_loja, data_coleta, fonte, descricao, rede, uf, municipio,
-              preco, preco_promocional, tipo_preco, id_execucao, id_arquivo, numero_linha
+              preco, preco_promocional, tipo_preco, ${EXTRAS.join(', ')},
+              id_execucao, id_arquivo, numero_linha
          FROM limpas
        ON CONFLICT (gtin, id_loja, data_coleta, fonte) DO UPDATE
           SET preco             = EXCLUDED.preco,
@@ -132,13 +141,22 @@ export async function mergeIncremental(
               rede              = COALESCE(EXCLUDED.rede, f.rede),
               uf                = COALESCE(EXCLUDED.uf, f.uf),
               municipio         = COALESCE(EXCLUDED.municipio, f.municipio),
+              ${EXTRAS_SET},
               id_execucao       = EXCLUDED.id_execucao,
               id_arquivo        = EXCLUDED.id_arquivo,
               numero_linha      = EXCLUDED.numero_linha,
               atualizado_em     = now()
-        WHERE f.preco             IS DISTINCT FROM EXCLUDED.preco
-           OR f.preco_promocional IS DISTINCT FROM EXCLUDED.preco_promocional
-           OR f.tipo_preco        IS DISTINCT FROM EXCLUDED.tipo_preco
+        -- Atualiza só quando alguma coluna mudou de fato: reexecutar o mesmo
+        -- arquivo grava zero, e reprocessar uma data antiga preenche as
+        -- colunas que ela ainda não tinha.
+        WHERE (f.preco, f.preco_promocional, f.tipo_preco,
+               f.descricao, f.rede, f.uf, f.municipio,
+               ${EXTRAS.map((n) => `f.${n}`).join(', ')})
+              IS DISTINCT FROM
+              (EXCLUDED.preco, EXCLUDED.preco_promocional, EXCLUDED.tipo_preco,
+               COALESCE(EXCLUDED.descricao, f.descricao), COALESCE(EXCLUDED.rede, f.rede),
+               COALESCE(EXCLUDED.uf, f.uf), COALESCE(EXCLUDED.municipio, f.municipio),
+               ${EXTRAS.map((n) => `EXCLUDED.${n}`).join(', ')})
        RETURNING f.id_arquivo, (f.criado_em = f.atualizado_em) AS foi_insert
      )
      SELECT id_arquivo,

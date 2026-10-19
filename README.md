@@ -239,8 +239,22 @@ colunas separadas por `|`, nulo gravado como `\N` (padrão do Spark).
 | `tipo_preco` | `Promoção` ou `Regular`, a partir de `flag_promocao` |
 | `gtin`, `descricao`, `rede`, `uf` | colunas de mesmo nome |
 
-As demais colunas seguem preservadas no payload de cada linha. Quando duas
-colunas do arquivo caem no mesmo nome interno, vale o primeiro valor não vazio.
+**Todas as 44 colunas do arquivo chegam à tabela final.** Além das acima, as
+outras 38 (`origem_preco`, `regiao`, `tipo_loja`, `cnpj`, `cep`, endereço,
+`categoria`, `secao`, conteúdo, `id_produto`, `tipo_produto`, promoção,
+`latitude`/`longitude`, `fabricante`, `cnpj_fabricante`, `marca_propria`,
+`preco_pago`, `preco_regular`, `preco_unidade_padrao`, `valor_promocao`,
+anúncio e `fonte_digital`) têm coluna própria e tipada em `fact_preco_coletado`
+— número, sim/não ou texto (CNPJ e CEP como texto, para não perder zeros à
+esquerda). `loja` e `id_loja` do arquivo também ficam como vieram (`loja`,
+`id_loja_origem`). A lista vive em `server/src/ingest/colunas-origem.ts`; um
+valor que não converte (número ilegível) fica vazio, sem barrar a linha.
+
+Quando duas colunas do arquivo caem no mesmo nome interno, vale o primeiro
+valor não vazio. O merge atualiza uma linha do fato quando qualquer coluna
+muda — reprocessar uma data gravada antes desta versão preenche as colunas
+novas; reexecutar sem mudança grava zero. A exportação CSV de preços leva
+todas as colunas.
 
 As colunas obrigatórias são `gtin`, `descricao`, `id_loja`, `preco` e
 `data_coleta`; outros nomes alternativos comuns (`ean`, `produto`,
