@@ -17,11 +17,31 @@ import type {
   QualidadeResposta,
   StatusResposta,
   ResumoBaseResposta,
+  RunsResposta,
+  DetalheRejeicaoResposta,
   ZerarBasePedido,
   ZerarBaseResposta,
 } from '@infoprice/shared';
 
 const BASE = '/api';
+
+export interface FiltroQualidade {
+  execucao?: number;
+  motivo?: string;
+  arquivo?: string;
+  busca?: string;
+  pagina?: number;
+}
+
+/** Monta a query string, omitindo o que está vazio. */
+function consulta(params: object): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') p.set(k, String(v));
+  }
+  const s = p.toString();
+  return s ? `?${s}` : '';
+}
 
 export class ErroApi extends Error {
   constructor(
@@ -106,8 +126,11 @@ export const api = {
       `/linhagem/preco/${id}`,
     ),
   inventario: () => pegar<InventarioResposta>('/inventario'),
-  qualidade: (run?: string) =>
-    pegar<QualidadeResposta>(`/qualidade${run ? `?run=${run}` : ''}`),
+  qualidade: (filtro: FiltroQualidade = {}) =>
+    pegar<QualidadeResposta>(`/qualidade${consulta(filtro)}`),
+  detalheRejeicao: (id: number) =>
+    pegar<DetalheRejeicaoResposta>(`/qualidade/rejeicoes/${id}`),
+  runs: () => pegar<RunsResposta>('/runs'),
   incidentes: () => pegar<IncidentesResposta>('/incidentes'),
   config: () => pegar<ConfigResposta>('/config'),
   ufs: () => pegar<string[]>('/precos/ufs'),
@@ -130,7 +153,9 @@ export const api = {
   },
 
   // ── Ações ────────────────────────────────────────────────────────────────
-  coletaManual: (run?: string) => enviar<AcaoResposta>('/execucoes', { run }),
+  /** Sem datas, a coleta do dia; com datas, uma por vez, em ordem. */
+  coletaManual: (runs?: string[]) =>
+    enviar<AcaoResposta>('/execucoes', runs ? { runs } : {}),
   pausar: () => enviar<AcaoResposta>('/agendamento/pausar'),
   retomar: () => enviar<AcaoResposta>('/agendamento/retomar'),
   cancelarExecucao: (id: number) =>
@@ -150,8 +175,8 @@ export const api = {
     `${BASE}/inventario/${encodeURIComponent(pasta)}/download`,
   urlAuditoriaCsv: (id: number) => `${BASE}/execucoes/${id}/auditoria.csv`,
   urlAuditoriaPdf: (id: number) => `${BASE}/execucoes/${id}/auditoria.pdf`,
-  urlRejeicoesCsv: (run: string) =>
-    `${BASE}/qualidade/rejeicoes.csv?run=${run}`,
+  urlRejeicoesCsv: (filtro: FiltroQualidade) =>
+    `${BASE}/qualidade/rejeicoes.csv${consulta({ ...filtro, pagina: undefined })}`,
   urlPrecosCsv: (filtros: Record<string, string | undefined>) => {
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(filtros)) {

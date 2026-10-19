@@ -35,9 +35,11 @@ export function PainelDoDia({
   // Enquanto houver coleta em andamento a tela se atualiza sozinha, para as
   // etapas avançarem sem o operador precisar recarregar.
   const [intervalo, setIntervalo] = useState<number | undefined>(undefined);
+  // Vazio = a coleta em andamento ou, sem nenhuma, o dia.
+  const [runEscolhido, setRunEscolhido] = useState(run ?? '');
   const recurso = useRecurso<PainelResposta>(
-    () => api.painel(run),
-    [run],
+    () => api.painel(runEscolhido || undefined),
+    [runEscolhido],
     intervalo,
   );
 
@@ -55,10 +57,25 @@ export function PainelDoDia({
   if (!dados) return null;
 
   const { execucao, etapas, kpis, aviso, historico } = dados;
+  // As datas que já têm execução, para rever o painel de cada uma.
+  const datas = [...new Set([dados.runDate, ...historico.map((h) => h.runDate)])].sort().reverse();
 
   return (
     <section className="tela">
       <TituloTela
+        acoes={
+          <label className="campo">
+            data
+            <select value={runEscolhido} onChange={(e) => setRunEscolhido(e.target.value)}>
+              <option value="">em andamento / hoje</option>
+              {datas.map((d) => (
+                <option key={d} value={d}>
+                  run={d}
+                </option>
+              ))}
+            </select>
+          </label>
+        }
         titulo="Coleta diária"
         descricao={
           <>

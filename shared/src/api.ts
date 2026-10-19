@@ -114,7 +114,75 @@ export interface QualidadeResposta {
   totalRejeitadas: number;
   percentual: number;
   motivos: { nome: string; quantidade: number }[];
-  rejeicoes: Rejeicao[];
+  rejeicoes: RejeicaoExplicada[];
+  /** Execuções recentes, para escolher qual examinar. */
+  execucoes: OpcaoExecucao[];
+  /** Arquivos da execução com rejeições, para filtrar. */
+  arquivos: { nome: string; quantidade: number }[];
+  /** Rejeições que atendem aos filtros (a página mostra até porPagina). */
+  filtradas: number;
+  pagina: number;
+  porPagina: number;
+}
+
+/** Campos interpretados que mais ajudam a entender uma rejeição. */
+export type CamposRejeicao = Partial<
+  Record<'gtin' | 'descricao' | 'id_loja' | 'preco' | 'preco_promocional' | 'data_coleta', string>
+>;
+
+export interface RejeicaoExplicada extends Rejeicao {
+  /** O que, nesta linha, fez a regra disparar — com os valores dela. */
+  explicacao: string;
+  campos: CamposRejeicao;
+}
+
+export interface OpcaoExecucao {
+  id: number;
+  runDate: string;
+  status: string;
+  iniciadoEm: string;
+  linhasRejeitadas: number;
+}
+
+/** GET /api/qualidade/rejeicoes/:id */
+export interface DetalheRejeicaoResposta {
+  rejeicao: RejeicaoExplicada;
+  runDate: string;
+  /** Cada coluna da linha original com o nome do cabeçalho do arquivo. */
+  colunas: { nome: string; valor: string }[];
+  colunasEsperadas: number;
+  colunasLidas: number;
+  delimitador: string | null;
+  /** O cabeçalho do arquivo foi guardado (arquivos de antes desta versão, não). */
+  cabecalhoConhecido: boolean;
+}
+
+/** Uma data que pode ser processada. */
+export interface RunDisponivel {
+  runDate: string;
+  /** A pasta run= ainda está na origem (SFTP). */
+  naOrigem: boolean;
+  arquivosOrigem: number;
+  /** Há cópia local na área temporária — permite processar mesmo fora da origem. */
+  copiaLocal: boolean;
+  arquivosLocais: number;
+  ultimaExecucao: {
+    id: number;
+    status: string;
+    finalizadoEm: string | null;
+    linhasGravadas: number;
+    linhasRejeitadas: number;
+  } | null;
+}
+
+/** GET /api/runs */
+export interface RunsResposta {
+  hoje: string;
+  runs: RunDisponivel[];
+  /** A origem não respondeu: só as cópias locais e o histórico aparecem. */
+  erroOrigem: string | null;
+  retencaoOrigemDias: number;
+  retencaoLocalDias: number;
 }
 
 /** GET /api/incidentes */

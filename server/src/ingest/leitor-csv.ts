@@ -184,6 +184,71 @@ export function validarCabecalho(info: InfoCabecalho): RecusaCabecalho | null {
   };
 }
 
+/**
+ * Campos internos a partir do cabeçalho já normalizado e dos valores da linha:
+ * nulo \N vira vazio, entre colunas que caem no mesmo nome interno vale o
+ * primeiro valor não vazio, e os campos derivados (preço, promoção) são
+ * completados. É o que a carga faz, e o que a tela de rejeições refaz.
+ */
+export function montarCampos(
+  cabecalho: string[],
+  valores: string[],
+): Record<string, string> {
+  const campos: Record<string, string> = {};
+  cabecalho.forEach((coluna, i) => {
+    if (!coluna) return;
+    const bruto = valores[i] ?? '';
+    const valor = bruto === NULO ? '' : bruto;
+    if (!campos[coluna]) campos[coluna] = valor;
+  });
+  derivarCampos(campos);
+  return campos;
+}
+
+export interface LinhaInterpretada {
+  /** Cada coluna do arquivo com o nome original do cabeçalho. */
+  colunas: { nome: string; valor: string }[];
+  /** Os campos internos (gtin, preco, data_coleta…) como a carga os viu. */
+  campos: Record<string, string>;
+  colunasEsperadas: number;
+  colunasLidas: number;
+}
+
+/**
+ * Reinterpreta uma linha guardada em ctl_rejeicao, com o cabeçalho do arquivo
+ * dela, do mesmo jeito que a carga a interpretou. Sem cabeçalho conhecido
+ * (arquivo de antes desta versão), as colunas saem numeradas.
+ */
+export function interpretarLinha(
+  cabecalhoBruto: string | null,
+  delimitador: string | null,
+  texto: string,
+): LinhaInterpretada {
+  const delim = delimitador ?? detectarDelimitador(cabecalhoBruto ?? texto);
+  const nomes = cabecalhoBruto
+    ? analisarRegistro(cabecalhoBruto.replace(/^\uFEFF/, ''), delim).campos
+    : [...config.coleta.colunasPosicao];
+
+  const r = analisarRegistro(texto, delim);
+  const valores =
+    r.completo && (!r.irregular || r.campos.length === nomes.length)
+      ? r.campos
+      : texto.split(delim).map(desaspar);
+
+  const total = Math.max(nomes.length, valores.length);
+  const colunas = Array.from({ length: total }, (_, i) => ({
+    nome: nomes[i] ?? (nomes.length > 0 ? `(coluna a mais ${i + 1 - nomes.length})` : `coluna ${i + 1}`),
+    valor: valores[i] ?? '',
+  }));
+
+  return {
+    colunas,
+    campos: nomes.length > 0 ? montarCampos(nomes.map(normalizarCabecalho), valores) : {},
+    colunasEsperadas: nomes.length,
+    colunasLidas: valores.length,
+  };
+}
+
 /** Lê só a primeira linha não vazia do arquivo, sem descompactar o resto. */
 export async function lerCabecalho(caminho: string): Promise<InfoCabecalho> {
   const entrada = fs.createReadStream(caminho);
@@ -419,19 +484,10 @@ export async function lerCsv(
 
   const emitir = async (valores: string[], payload: string, erro?: string) => {
     numeroLinha += 1;
-    const campos: Record<string, string> = {};
-    if (!erro) {
-      cabecalho.forEach((coluna, i) => {
-        if (!coluna) return;
-        const bruto = valores[i] ?? '';
-        const valor = bruto === NULO ? '' : bruto;
-        // Duas colunas no mesmo nome interno: fica o primeiro valor não vazio.
-        if (!campos[coluna]) campos[coluna] = valor;
-      });
-      derivarCampos(campos);
-    }
-    // O payload guarda a linha como veio, para a tela de rejeições poder
-    // mostrar o original.
+    const campos = erro ? {} : montarCampos(cabecalho, valores);
+    // O payload guarda a linha exatamente como veio — com o delimitador e as
+    // aspas originais —, para a tela de rejeições mostrar o original e
+    // reinterpretá-lo coluna a coluna.
     lote.push({ numeroLinha, campos, payload, ...(erro ? { erro } : {}) });
     if (lote.length >= tamanhoLote) {
       await aoLote(lote);
@@ -470,7 +526,7 @@ export async function lerCsv(
       if (!primeira.includes('"')) {
         pendentes.shift();
         const valores = primeira.split(delim).map((v) => v.trim());
-        await emitir(valores, valores.join(';'));
+        await emitir(valores, primeira);
         continue;
       }
 
@@ -500,9 +556,9 @@ export async function lerCsv(
         (!registro.irregular ||
           (usadas === 1 && registro.campos.length === cabecalho.length))
       ) {
-        pendentes.splice(0, usadas);
+        const texto = pendentes.splice(0, usadas).join('\n');
         if (registro.irregular) recuperadas += 1;
-        await emitir(registro.campos, registro.campos.join(';'));
+        await emitir(registro.campos, texto);
         continue;
       }
 
@@ -513,7 +569,7 @@ export async function lerCsv(
       const valores = primeira.split(delim).map(desaspar);
       if (valores.length === cabecalho.length) {
         recuperadas += 1;
-        await emitir(valores, valores.join(';'));
+        await emitir(valores, primeira);
       } else {
         malformadas += 1;
         await emitir(

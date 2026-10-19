@@ -233,17 +233,32 @@ async function rodarEtapas(
   });
 
   // ── 2 · Listagem do diretório ─────────────────────────────────────────────
+  // A origem guarda cada pasta por poucos dias. Uma data que já saiu dela
+  // ainda pode ser processada a partir das cópias locais da área temporária,
+  // que ficam por RETENCAO_LOCAL_DIAS.
+  let usandoCopiaLocal = false;
+  const destinoDir = path.join(config.coleta.areaTemporaria, runDate);
   await verificar();
   const remotos = await registro.etapa('Listagem do diretório', async () => {
     const pastas = await driver.listarPastas();
     const pasta = pastas.find((p) => p.runDate === runDate);
-    if (!pasta) {
-      throw new Error(
-        `pasta ${pastaNome} não encontrada em ${config.sftp.diretorioBase}`,
+
+    let arquivos: ArquivoRemoto[];
+    if (pasta) {
+      arquivos = await driver.listarArquivos(pasta.caminho);
+    } else {
+      arquivos = await listarCopiasLocais(destinoDir);
+      if (arquivos.length === 0) {
+        throw new Error(
+          `pasta ${pastaNome} não encontrada em ${config.sftp.diretorioBase} ` +
+            `nem cópia local em ${destinoDir}`,
+        );
+      }
+      usandoCopiaLocal = true;
+      await registro.warn(
+        `pasta ${pastaNome} não está mais na origem · usando as ${arquivos.length} cópias locais de ${destinoDir}`,
       );
     }
-
-    let arquivos = await driver.listarArquivos(pasta.caminho);
     if (opcoes.somenteArquivos?.length) {
       const alvo = new Set(opcoes.somenteArquivos);
       arquivos = arquivos.filter((a) => alvo.has(a.nome));
@@ -256,7 +271,8 @@ async function rodarEtapas(
 
     const bytes = arquivos.reduce((s, a) => s + a.tamanhoBytes, 0);
     await registro.info(
-      `listagem ${config.sftp.diretorioBase}/${pastaNome} → ${arquivos.length} objetos, ${bytesBR(bytes)}`,
+      `listagem ${usandoCopiaLocal ? destinoDir : `${config.sftp.diretorioBase}/${pastaNome}`} → ` +
+        `${arquivos.length} objetos, ${bytesBR(bytes)}`,
     );
 
     await compararComMedia(registro, runDate, arquivos.length);
@@ -264,14 +280,15 @@ async function rodarEtapas(
 
     return {
       resultado: arquivos,
-      detalhe: `${pastaNome} · ${arquivos.length} arquivos · ${bytesBR(bytes)}`,
+      detalhe:
+        `${pastaNome} · ${arquivos.length} arquivos · ${bytesBR(bytes)}` +
+        (usandoCopiaLocal ? ' · cópia local' : ''),
     };
   });
 
   await registro.atualizar({ arquivos_vistos: remotos.length });
 
   // ── 3 · Download para área temporária ─────────────────────────────────────
-  const destinoDir = path.join(config.coleta.areaTemporaria, runDate);
   const baixados = await registro.etapa(
     'Download para área temporária',
     async () => {
@@ -287,7 +304,10 @@ async function rodarEtapas(
         async (arquivo) => {
           await verificar();
           const caminhoLocal = path.join(destinoDir, arquivo.nome);
-          const bytes = await driver.baixar(arquivo.caminho, caminhoLocal);
+          // Da cópia local não há o que baixar: ela já está no destino.
+          const bytes = usandoCopiaLocal
+            ? (await fsp.stat(caminhoLocal)).size
+            : await driver.baixar(arquivo.caminho, caminhoLocal);
           const idArquivo = await marcarBaixado(
             registro.id,
             pastaNome,
@@ -360,6 +380,12 @@ async function rodarEtapas(
         const info = await lerCabecalho(arquivo.caminhoLocal);
         colunas = Math.max(colunas, info.colunas.length);
         recusa = validarCabecalho(info);
+        // Guardado para a tela de rejeições mostrar cada valor ao lado do
+        // nome da coluna.
+        await pool.query(
+          `UPDATE infoprice.ctl_arquivo SET cabecalho = $2, delimitador = $3 WHERE id = $1`,
+          [arquivo.idArquivo, info.semCabecalho ? null : info.primeiraLinha, info.delimitador],
+        );
       } catch (erro) {
         recusa = { motivo: erro instanceof Error ? erro.message : String(erro), amostra: '' };
       }
@@ -800,6 +826,25 @@ async function registrarInventario(
       [idExecucao, linha.id],
     );
   }
+}
+
+/** Os .csv/.csv.gz já baixados para a pasta do run na área temporária. */
+async function listarCopiasLocais(dir: string): Promise<ArquivoRemoto[]> {
+  let nomes: string[];
+  try {
+    nomes = await fsp.readdir(dir);
+  } catch {
+    return [];
+  }
+  const arquivos: ArquivoRemoto[] = [];
+  for (const nome of nomes.filter((n) => /\.csv(\.gz)?$/.test(n)).sort()) {
+    const caminho = path.join(dir, nome);
+    const info = await fsp.stat(caminho);
+    if (info.isFile()) {
+      arquivos.push({ nome, caminho, tamanhoBytes: info.size, modificadoEm: info.mtime });
+    }
+  }
+  return arquivos;
 }
 
 /** Marca o arquivo como baixado e devolve seu id em ctl_arquivo. */

@@ -15,6 +15,7 @@ import type {
   PrecosResposta,
   QualidadeResposta,
   StatusResposta,
+  Execucao,
 } from '@infoprice/shared';
 import { config } from '../config.js';
 import { consultar, consultarUm } from '../db/pool.js';
@@ -28,6 +29,16 @@ import {
 } from '../agendador/index.js';
 import { executarColeta } from '../ingest/pipeline.js';
 import { pedirCancelamento } from '../ingest/cancelamento.js';
+import { listarRuns, tipoDaCarga } from './runs.js';
+import {
+  arquivosComRejeicao,
+  detalheRejeicao,
+  execucoesRecentes,
+  listarRejeicoes,
+  motivosDaExecucao,
+  todasRejeicoes,
+  type FiltroRejeicoes,
+} from './rejeicoes.js';
 import { SQL_PERSISTENCIA } from '../ingest/merge-incremental.js';
 import { resolverIncidente } from '../alertas/index.js';
 import {
@@ -176,7 +187,15 @@ rotas.post(
 rotas.get(
   '/painel',
   rota(async (req, res) => {
-    const runDate = (req.query.run as string) || dataLocal();
+    // Sem data escolhida, a tela abre na coleta em andamento — que pode ser de
+    // uma data anterior — e, sem nenhuma, no dia.
+    const emAndamento = req.query.run
+      ? null
+      : await consultarUm<{ run_date: string }>(
+          `SELECT run_date::text AS run_date FROM infoprice.ctl_execucao
+            WHERE status = 'em_execucao' ORDER BY id DESC LIMIT 1`,
+        );
+    const runDate = (req.query.run as string) || emAndamento?.run_date || dataLocal();
     const execucao = await q.execucaoDoRun(runDate);
     const etapas = execucao ? await q.etapasDaExecucao(execucao.id) : [];
     const historico = await q.historicoExecucoes(
@@ -394,25 +413,75 @@ rotas.get(
   }),
 );
 
+const FORMATO_DATA = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Coleta manual de uma ou várias datas, em sequência e em segundo plano. A
+ * tela recebe a confirmação na hora e acompanha o progresso pelo painel.
+ *
+ * Uma data só (o caso do dia) mantém as retentativas automáticas. Várias datas
+ * rodam uma vez cada, uma depois da outra: uma falha numa data não segura as
+ * seguintes, e parar a coleta encerra a fila.
+ */
 rotas.post(
   '/execucoes',
   exigirOperador,
   rota(async (req, res) => {
-    const runDate = (req.body?.run as string) || dataLocal();
-    const quem = operador(req);
+    const hoje = dataLocal();
+    const pedidas: unknown[] = Array.isArray(req.body?.runs)
+      ? req.body.runs
+      : [req.body?.run || hoje];
+    const runs = [...new Set(pedidas.map(String))].sort();
 
-    // A coleta roda em segundo plano: a tela recebe a confirmação na hora e
-    // acompanha o progresso pelo painel.
+    const invalida = runs.find((r) => !FORMATO_DATA.test(r) || Number.isNaN(Date.parse(r)));
+    if (invalida !== undefined || runs.length === 0) {
+      res.status(400).json({ erro: `data inválida: ${invalida ?? '(nenhuma)'} · use AAAA-MM-DD` });
+      return;
+    }
+    if (runs.some((r) => r > hoje)) {
+      res.status(400).json({ erro: `não há como coletar uma data futura (hoje é ${hoje})` });
+      return;
+    }
+    if (runs.length > 60) {
+      res.status(400).json({ erro: 'no máximo 60 datas por vez' });
+      return;
+    }
+
+    const quem = operador(req);
     const idUsuario = idOperador(req);
-    comTrilho(() =>
-      coletaDiariaComTentativas(runDate, 'manual', idUsuario),
-    ).catch((erro) => console.error('[coleta manual]', erro.message));
+
+    comTrilho(async () => {
+      if (runs.length === 1 && runs[0] === hoje) {
+        await coletaDiariaComTentativas(hoje, 'manual', idUsuario);
+        return;
+      }
+      for (const runDate of runs) {
+        const r = await executarColeta({
+          runDate,
+          gatilho: 'manual',
+          tipo: await tipoDaCarga(runDate),
+          idUsuario,
+        });
+        if (r.status === 'cancelada') break;
+      }
+    }).catch((erro) => console.error('[coleta manual]', erro.message));
 
     const r: AcaoResposta = {
       ok: true,
-      mensagem: `Coleta manual de run=${runDate} disparada por ${quem}`,
+      mensagem:
+        runs.length === 1
+          ? `Coleta manual de run=${runs[0]} disparada por ${quem}`
+          : `Coleta de ${runs.length} datas disparada por ${quem} · ${runs[0]} a ${runs[runs.length - 1]}, uma por vez`,
     };
     res.status(202).json(r);
+  }),
+);
+
+/** Datas que podem ser processadas: na origem, com cópia local e já executadas. */
+rotas.get(
+  '/runs',
+  rota(async (_req, res) => {
+    res.json(await listarRuns());
   }),
 );
 
@@ -760,33 +829,69 @@ rotas.get(
 
 // ── Qualidade e rejeições ───────────────────────────────────────────────────
 
+/** Filtro de rejeições a partir da query: execução, motivo, arquivo e busca. */
+function filtroDe(req: Request, idExecucao: number): FiltroRejeicoes {
+  const texto = (v: unknown) => (typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined);
+  return {
+    idExecucao,
+    motivo: texto(req.query.motivo),
+    arquivo: texto(req.query.arquivo),
+    busca: texto(req.query.busca),
+  };
+}
+
+/**
+ * A execução a examinar: a pedida pelo id, a última do run pedido ou, sem
+ * nenhum dos dois, a mais recente — que pode ser de qualquer data.
+ */
+async function execucaoDaQualidade(req: Request): Promise<Execucao | null> {
+  if (req.query.execucao) return q.buscarExecucao(Number(req.query.execucao));
+  if (req.query.run) return q.execucaoDoRun(String(req.query.run));
+  const ultima = await consultarUm<{ id: number }>(
+    'SELECT id FROM infoprice.ctl_execucao ORDER BY id DESC LIMIT 1',
+  );
+  return ultima ? q.buscarExecucao(ultima.id) : null;
+}
+
+const POR_PAGINA = 100;
+
 rotas.get(
   '/qualidade',
   rota(async (req, res) => {
-    const runDate = (req.query.run as string) || dataLocal();
-    const execucao = await q.execucaoDoRun(runDate);
+    const [execucao, execucoes] = await Promise.all([
+      execucaoDaQualidade(req),
+      execucoesRecentes(),
+    ]);
 
     if (!execucao) {
       const vazio: QualidadeResposta = {
-        runDate,
+        runDate: (req.query.run as string) || dataLocal(),
         idExecucao: null,
         totalLinhas: 0,
         totalRejeitadas: 0,
         percentual: 0,
         motivos: [],
         rejeicoes: [],
+        execucoes,
+        arquivos: [],
+        filtradas: 0,
+        pagina: 1,
+        porPagina: POR_PAGINA,
       };
       res.json(vazio);
       return;
     }
 
-    const [motivos, lista] = await Promise.all([
-      q.motivosRejeicao(execucao.id),
-      q.rejeicoes(execucao.id, inteiro(req.query.limite, 50)),
+    const filtro = filtroDe(req, execucao.id);
+    const pagina = inteiro(req.query.pagina, 1);
+    const [motivos, arquivos, lista] = await Promise.all([
+      motivosDaExecucao(filtro),
+      arquivosComRejeicao(execucao.id),
+      listarRejeicoes(filtro, pagina, POR_PAGINA),
     ]);
 
     const resposta: QualidadeResposta = {
-      runDate,
+      runDate: execucao.runDate,
       idExecucao: execucao.id,
       totalLinhas: execucao.linhasStaging,
       totalRejeitadas: execucao.linhasRejeitadas,
@@ -795,9 +900,27 @@ rotas.get(
           ? (execucao.linhasRejeitadas / execucao.linhasStaging) * 100
           : 0,
       motivos,
-      rejeicoes: lista,
+      rejeicoes: lista.rejeicoes,
+      execucoes,
+      arquivos,
+      filtradas: lista.filtradas,
+      pagina,
+      porPagina: POR_PAGINA,
     };
     res.json(resposta);
+  }),
+);
+
+/** Uma rejeição com a linha original coluna a coluna e a explicação. */
+rotas.get(
+  '/qualidade/rejeicoes/:id(\\d+)',
+  rota(async (req, res) => {
+    const detalhe = await detalheRejeicao(Number(req.params.id));
+    if (!detalhe) {
+      res.status(404).json({ erro: 'rejeição não encontrada' });
+      return;
+    }
+    res.json(detalhe);
   }),
 );
 
@@ -1162,34 +1285,24 @@ rotas.get(
 rotas.get(
   '/qualidade/rejeicoes.csv',
   rota(async (req, res) => {
-    const runDate = (req.query.run as string) || dataLocal();
-    const execucao = await q.execucaoDoRun(runDate);
+    const execucao = await execucaoDaQualidade(req);
     if (!execucao) {
-      res.status(404).json({ erro: 'sem execução para o run informado' });
+      res.status(404).json({ erro: 'sem execução para exportar' });
       return;
     }
 
-    const linhas = await consultar<{
-      arquivo: string;
-      numero_linha: number;
-      motivo: string;
-      payload: string;
-      tratamento: string;
-      criado_em: string;
-    }>(
-      `SELECT arquivo, numero_linha, motivo, payload, tratamento, criado_em
-         FROM infoprice.ctl_rejeicao
-        WHERE id_execucao = $1
-        ORDER BY id`,
-      [execucao.id],
-    );
-
+    const linhas = await todasRejeicoes(filtroDe(req, execucao.id));
     enviarCsv(
       res,
-      `rejeicoes-${runDate}.csv`,
-      ['arquivo', 'linha', 'motivo', 'payload', 'tratamento', 'registrado_em'],
+      `rejeicoes-${execucao.runDate}-exec${execucao.id}.csv`,
+      ['arquivo', 'linha', 'motivo', 'explicacao', 'gtin', 'descricao', 'loja',
+       'preco', 'preco_promocional', 'data_coleta', 'linha_original', 'tratamento',
+       'registrado_em'],
       linhas.map((l) => [
-        l.arquivo, l.numero_linha, l.motivo, l.payload, l.tratamento, l.criado_em,
+        l.arquivo, l.numeroLinha, l.motivo, l.explicacao,
+        l.campos.gtin ?? '', l.campos.descricao ?? '', l.campos.id_loja ?? '',
+        l.campos.preco ?? '', l.campos.preco_promocional ?? '', l.campos.data_coleta ?? '',
+        l.payload, l.tratamento, l.criadoEm,
       ]),
     );
   }),

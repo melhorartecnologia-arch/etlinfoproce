@@ -58,6 +58,41 @@ a pessoa troque. Cinco falhas de login em 15 minutos travam o usuário — e o
 limite por IP é quatro vezes maior, para não punir um escritório inteiro atrás
 do mesmo NAT. Toda tentativa fica registrada em `ctl_tentativa_login`.
 
+## Processar datas anteriores
+
+**Coleta manual** abre a lista de datas que podem ser processadas: as pastas
+`run=` que ainda estão na origem, as que têm cópia local na área temporária e,
+para cada uma, a última execução. Marque uma ou várias — elas rodam uma por
+vez, da mais antiga para a mais nova; uma falha numa data não segura as
+seguintes, e **Parar coleta** encerra a fila. A natureza de cada carga é
+registrada: *carga histórica* para uma data passada nunca processada,
+*reprocessamento* para uma já processada (sem duplicar nada).
+
+A origem guarda cada pasta por `RETENCAO_ORIGEM_DIAS` (5). Uma data que já saiu
+dela continua podendo ser processada enquanto houver cópia local
+(`RETENCAO_LOCAL_DIAS`, 30): o pipeline usa os arquivos da área temporária no
+lugar do download e registra isso no log.
+
+**Coleta do dia** abre na coleta em andamento — que pode ser de uma data
+anterior — e tem um seletor para rever o painel de qualquer data já processada.
+
+## Entender as rejeições
+
+**Qualidade e rejeições** examina qualquer execução (seletor no topo; abre na
+mais recente). Os motivos filtram a lista ao clique; dá para filtrar também por
+arquivo e procurar um trecho na linha (GTIN, loja, descrição). Cada linha
+rejeitada traz uma explicação com os valores dela, por exemplo:
+
+- `GTIN "7896110000283": o dígito verificador deveria ser 2, mas veio 3.`
+- `Data 2026-10-20 é posterior ao run 2026-10-17.`
+- `A linha tem 45 colunas e o cabeçalho 44.` (aspa sem par ou delimitador a mais)
+
+Ao clicar, aparece a linha original como veio e, ao lado, cada coluna com o
+nome do cabeçalho do arquivo, com as colunas que dispararam a regra em
+destaque. A exportação CSV respeita os filtros e leva a explicação e os campos
+interpretados. A linha é guardada exatamente como veio, e o cabeçalho de cada
+arquivo fica em `ctl_arquivo`, para que a tela refaça a interpretação da carga.
+
 ## Parar uma coleta
 
 Durante uma coleta, o cabeçalho troca **Coleta manual** por **Parar coleta**
@@ -411,7 +446,9 @@ run, então uma tentativa que falha três vezes abre um incidente, não três.
 | GET | `/api/execucoes/:id/linhagem` | fluxo e contagem por arquivo |
 | GET | `/api/linhagem/preco/:id` | caminho inverso de uma linha do fato |
 | GET | `/api/inventario` | pastas monitoradas e retenção |
-| GET | `/api/qualidade` | motivos e linhas rejeitadas |
+| GET | `/api/qualidade` | motivos e rejeições explicadas: `execucao`, `motivo`, `arquivo`, `busca`, `pagina` |
+| GET | `/api/qualidade/rejeicoes/:id` | linha rejeitada coluna a coluna, com a explicação |
+| GET | `/api/runs` | datas processáveis: na origem, com cópia local e última execução |
 | GET | `/api/incidentes` | incidentes e regras de notificação |
 | GET | `/api/precos` | consulta do fato, com origem em cada linha |
 | GET | `/api/config` | conexão, agendamento, destino e tabelas |
@@ -424,7 +461,7 @@ run, então uma tentativa que falha três vezes abre um incidente, não três.
 | PATCH | `/api/usuarios/:id` | edita papel, nome ou situação (administrador) |
 | POST | `/api/usuarios/:id/senha` | redefine senha (administrador) |
 | GET | `/api/usuarios/tentativas` | auditoria de acesso (administrador) |
-| POST | `/api/execucoes` | coleta manual |
+| POST | `/api/execucoes` | coleta manual: `{ runs: ["AAAA-MM-DD", …] }`, uma por vez |
 | POST | `/api/execucoes/:id/cancelar` | para a coleta em andamento |
 | POST | `/api/execucoes/:id/reprocessar` | reprocessa o run |
 | POST | `/api/arquivos/:id/reprocessar` | reprocessa um arquivo |

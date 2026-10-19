@@ -23,6 +23,7 @@ import { Precos } from './telas/Precos.js';
 import { Configuracao } from './telas/Configuracao.js';
 import { Usuarios } from './telas/Usuarios.js';
 import { Manutencao } from './telas/Manutencao.js';
+import { DialogoColeta } from './componentes/DialogoColeta.js';
 
 export function App() {
   const [usuario, setUsuario] = useState<UsuarioSessao | null>(null);
@@ -134,10 +135,13 @@ function Console({
     setTela(t);
   }, []);
 
-  const coletarAgora = async () => {
+  const [escolhendoDatas, setEscolhendoDatas] = useState(false);
+
+  const coletar = async (runs: string[]) => {
     try {
-      const r = await api.coletaManual();
+      const r = await api.coletaManual(runs);
       avisar(r.mensagem);
+      setEscolhendoDatas(false);
       setTela('hoje');
       recarregarTudo();
     } catch (erro) {
@@ -193,7 +197,7 @@ function Console({
             setDensidade(densidade === 'compacta' ? 'confortavel' : 'compacta')
           }
           aoAlternarAgendamento={alternarAgendamento}
-          aoColetar={coletarAgora}
+          aoColetar={() => setEscolhendoDatas(true)}
           aoParar={pararColeta}
           aoSair={aoSair}
           aoAvisar={avisar}
@@ -255,6 +259,10 @@ function Console({
           )}
         </div>
       </main>
+
+      {escolhendoDatas && (
+        <DialogoColeta aoFechar={() => setEscolhendoDatas(false)} aoColetar={coletar} />
+      )}
 
       <Toast aviso={toast} />
     </div>

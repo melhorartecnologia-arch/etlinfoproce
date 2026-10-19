@@ -9,7 +9,6 @@ import type {
   PastaInventario,
   Preco,
   RegraAlerta,
-  Rejeicao,
   StatusExecucao,
 } from '@infoprice/shared';
 import { config } from '../config.js';
@@ -410,42 +409,6 @@ export async function caminhoInverso(
       }`,
     },
   ];
-}
-
-export async function motivosRejeicao(
-  idExecucao: number,
-): Promise<{ nome: string; quantidade: number }[]> {
-  return consultar<{ nome: string; quantidade: number }>(
-    `SELECT motivo AS nome, count(*)::bigint AS quantidade
-       FROM infoprice.ctl_rejeicao
-      WHERE id_execucao = $1
-      GROUP BY motivo
-      ORDER BY quantidade DESC`,
-    [idExecucao],
-  );
-}
-
-export async function rejeicoes(
-  idExecucao: number,
-  limite = 50,
-): Promise<Rejeicao[]> {
-  return consultar<Rejeicao>(
-    `SELECT id,
-            id_execucao  AS "idExecucao",
-            arquivo,
-            numero_linha AS "numeroLinha",
-            motivo,
-            payload,
-            tratamento,
-            criado_em    AS "criadoEm"
-       FROM infoprice.ctl_rejeicao
-      WHERE id_execucao = $1
-      -- Por arquivo e linha, não por ordem de inserção: as regras rodam em
-      -- sequência, então ordenar por id mostraria só o primeiro motivo.
-      ORDER BY arquivo, numero_linha
-      LIMIT $2`,
-    [idExecucao, limite],
-  );
 }
 
 export async function listarIncidentes(): Promise<Incidente[]> {
