@@ -36,6 +36,8 @@ export interface ParametrosCarga {
   caminhoLocal: string;
   runDate: string;
   fonte: string;
+  /** Chamado a cada lote lido: lança se a parada da coleta foi pedida. */
+  verificar?: () => Promise<void>;
 }
 
 export interface ResultadoCarga {
@@ -90,6 +92,7 @@ export async function carregarArquivoEmStaging(
 
   try {
     const resultado = await lerCsv(p.caminhoLocal, async (lote) => {
+      await p.verificar?.();
       for (const linha of lote) {
         if (falhaCopy) throw falhaCopy;
         const c = linha.campos;

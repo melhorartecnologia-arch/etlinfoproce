@@ -8,6 +8,7 @@
  */
 import { fecharPool } from '../db/pool.js';
 import { executarColeta } from '../ingest/pipeline.js';
+import { cancelarTodasLocais } from '../ingest/cancelamento.js';
 import { numeroBR } from '../util/formato.js';
 import { dataLocal } from '../util/tempo.js';
 
@@ -24,6 +25,22 @@ async function main(): Promise<void> {
     | 'carga_historica';
 
   console.log(`[ingest] run=${runDate} · tipo=${tipo}`);
+
+  // Ctrl+C para a coleta num ponto seguro, em vez de matar o processo e
+  // deixar a execução órfã em andamento. Um segundo Ctrl+C encerra na hora —
+  // mas só depois de 2 s: o terminal entrega o sinal a todo o grupo (npm, tsx,
+  // node) e o tsx ainda o repassa ao filho, então um único Ctrl+C chega aqui
+  // duas vezes quase juntas.
+  let primeiroCtrlC = 0;
+  process.on('SIGINT', () => {
+    if (primeiroCtrlC === 0) {
+      primeiroCtrlC = Date.now();
+      console.warn('\n[ingest] parando a coleta… (Ctrl+C de novo encerra na hora)');
+      void cancelarTodasLocais('interrompida no terminal (Ctrl+C)');
+    } else if (Date.now() - primeiroCtrlC > 2000) {
+      process.exit(130);
+    }
+  });
 
   const r = await executarColeta({
     runDate,
@@ -42,6 +59,7 @@ async function main(): Promise<void> {
   if (r.erro) console.log(`erro         ${r.erro}`);
 
   if (r.status === 'falha') process.exitCode = 1;
+  if (r.status === 'cancelada') process.exitCode = 130;
 }
 
 main()

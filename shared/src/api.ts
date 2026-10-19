@@ -30,6 +30,14 @@ export interface StatusResposta {
     banco: string;
     schema: string;
   };
+  /** A coleta em andamento, se houver — o cabeçalho oferece pará-la. */
+  emAndamento: {
+    id: number;
+    runDate: string;
+    iniciadoEm: string;
+    /** A parada já foi pedida e a coleta está chegando a um ponto seguro. */
+    parando: boolean;
+  } | null;
 }
 
 /** GET /api/painel — a tela "Coleta do dia". */
@@ -179,6 +187,8 @@ export interface ResumoBaseResposta {
   /** Frase que precisa ser digitada para confirmar. */
   frase: string;
   coletaEmAndamento: boolean;
+  /** Id da coleta em andamento, para a tela oferecer pará-la. */
+  idEmAndamento: number | null;
   ultimoReset: UltimoReset | null;
 }
 

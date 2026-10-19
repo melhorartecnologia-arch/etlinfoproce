@@ -12,7 +12,7 @@ import { coletaEmAndamento, comTrilho } from '../agendador/index.js';
 import {
   FRASE_CONFIRMACAO,
   contarBase,
-  existeColetaEmAndamento,
+  execucaoEmAndamento,
   ultimoReset,
   zerarBase,
 } from '../admin/reset.js';
@@ -38,11 +38,13 @@ function rota(
 rotasAdmin.get(
   '/base',
   rota(async (_req, res) => {
+    const idEmAndamento = await execucaoEmAndamento();
     const r: ResumoBaseResposta = {
       contagens: await contarBase(),
       areaTemporaria: config.coleta.areaTemporaria,
       frase: FRASE_CONFIRMACAO,
-      coletaEmAndamento: coletaEmAndamento() || (await existeColetaEmAndamento()),
+      coletaEmAndamento: coletaEmAndamento() || idEmAndamento !== null,
+      idEmAndamento,
       ultimoReset: await ultimoReset(),
     };
     res.json(r);

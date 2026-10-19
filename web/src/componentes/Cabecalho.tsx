@@ -10,6 +10,7 @@ export function Cabecalho({
   alternarDensidade,
   aoAlternarAgendamento,
   aoColetar,
+  aoParar,
   aoSair,
   aoAvisar,
 }: {
@@ -20,6 +21,7 @@ export function Cabecalho({
   alternarDensidade: () => void;
   aoAlternarAgendamento: () => void;
   aoColetar: () => void;
+  aoParar: (id: number) => void;
   aoSair: () => void;
   aoAvisar: (texto: string, erro?: boolean) => void;
 }) {
@@ -69,9 +71,20 @@ export function Cabecalho({
             {pausado ? 'Retomar agendamento' : 'Pausar agendamento'}
           </button>
 
-          <button className="botao botao--primario" onClick={aoColetar}>
-            Coleta manual
-          </button>
+          {status?.emAndamento ? (
+            <button
+              className="botao botao--perigo"
+              onClick={() => aoParar(status.emAndamento!.id)}
+              disabled={status.emAndamento.parando}
+              title={`Execução #${status.emAndamento.id} · run=${status.emAndamento.runDate}`}
+            >
+              {status.emAndamento.parando ? 'Parando coleta…' : 'Parar coleta'}
+            </button>
+          ) : (
+            <button className="botao botao--primario" onClick={aoColetar}>
+              Coleta manual
+            </button>
+          )}
         </>
       )}
 

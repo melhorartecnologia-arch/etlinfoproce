@@ -58,6 +58,29 @@ a pessoa troque. Cinco falhas de login em 15 minutos travam o usuário — e o
 limite por IP é quatro vezes maior, para não punir um escritório inteiro atrás
 do mesmo NAT. Toda tentativa fica registrada em `ctl_tentativa_login`.
 
+## Parar uma coleta
+
+Durante uma coleta, o cabeçalho troca **Coleta manual** por **Parar coleta**
+(operador); o detalhe da execução e a tela de zerar a base têm o mesmo botão.
+A coleta para num ponto seguro — entre arquivos, a cada lote lido, e a consulta
+SQL em curso é interrompida no próprio PostgreSQL. Os arquivos já gravados
+ficam, o arquivo em curso é revertido, e a execução termina como `cancelada`,
+sem abrir incidente nem disparar nova tentativa. A varredura das 12:00 e 18:00
+retoma os arquivos que ficaram pendentes; pause o agendamento se não quiser isso.
+
+O pedido de parada fica no banco, então alcança também uma coleta rodando no
+terminal (`npm run ingest`). Ali, **Ctrl+C** faz a mesma parada segura; um
+segundo Ctrl+C, depois de 2 s, encerra na hora. Desligar o servidor
+(`pm2 stop`, SIGTERM) também para a coleta antes de sair.
+
+**Coleta órfã.** A coleta grava um batimento a cada 30 s. Se o processo morrer
+sem parar a coleta (queda de energia, terminal fechado à força), a execução
+ficaria "em andamento" para sempre — e, como só uma pode estar em andamento,
+bloquearia o reset e toda coleta nova. Uma execução sem batimento há mais de
+2 minutos é tratada como órfã: é encerrada como cancelada na subida do
+servidor, antes de uma coleta nova começar, antes de zerar a base, ou na hora,
+pelo botão **Parar coleta**.
+
 ## Zerar a base
 
 Apaga todo o histórico de dados e de metadados e deixa a aplicação como
@@ -402,6 +425,7 @@ run, então uma tentativa que falha três vezes abre um incidente, não três.
 | POST | `/api/usuarios/:id/senha` | redefine senha (administrador) |
 | GET | `/api/usuarios/tentativas` | auditoria de acesso (administrador) |
 | POST | `/api/execucoes` | coleta manual |
+| POST | `/api/execucoes/:id/cancelar` | para a coleta em andamento |
 | POST | `/api/execucoes/:id/reprocessar` | reprocessa o run |
 | POST | `/api/arquivos/:id/reprocessar` | reprocessa um arquivo |
 | POST | `/api/inventario/:pasta/reprocessar` | reprocessa a pasta |

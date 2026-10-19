@@ -133,6 +133,8 @@ export const api = {
   coletaManual: (run?: string) => enviar<AcaoResposta>('/execucoes', { run }),
   pausar: () => enviar<AcaoResposta>('/agendamento/pausar'),
   retomar: () => enviar<AcaoResposta>('/agendamento/retomar'),
+  cancelarExecucao: (id: number) =>
+    enviar<AcaoResposta>(`/execucoes/${id}/cancelar`),
   reprocessarRun: (id: number) =>
     enviar<AcaoResposta>(`/execucoes/${id}/reprocessar`),
   reprocessarArquivo: (id: number) =>

@@ -24,12 +24,14 @@ import {
 export function DetalheExecucao({
   id,
   podeOperar,
+  aoParar,
   aoVoltar,
   aoAvisar,
   aoRecarregarStatus,
 }: {
   id: number | null;
   podeOperar: boolean;
+  aoParar: (id: number) => Promise<void>;
   aoVoltar: () => void;
   aoAvisar: (texto: string, erro?: boolean) => void;
   aoRecarregarStatus: () => void;
@@ -106,7 +108,18 @@ export function DetalheExecucao({
             >
               Auditoria PDF
             </a>
-            {podeOperar && (
+            {podeOperar && e.status === 'em_execucao' && (
+              <button
+                className="botao botao--perigo"
+                onClick={async () => {
+                  await aoParar(e.id);
+                  setTimeout(recurso.recarregar, 3000);
+                }}
+              >
+                Parar execução
+              </button>
+            )}
+            {podeOperar && e.status !== 'em_execucao' && (
               <button className="botao botao--acento" onClick={reprocessar}>
                 Reprocessar run
               </button>

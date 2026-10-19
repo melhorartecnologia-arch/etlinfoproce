@@ -4,6 +4,7 @@ import pg from 'pg';
 import type { ContagensBase, UltimoReset } from '@infoprice/shared';
 import { config } from '../config.js';
 import { consultarUm, emTransacao, pool, type Cliente } from '../db/pool.js';
+import { encerrarOrfas } from '../ingest/cancelamento.js';
 
 /** O que precisa ser digitado para confirmar, na tela e no terminal. */
 export const FRASE_CONFIRMACAO = 'ZERAR TUDO';
@@ -94,12 +95,15 @@ export async function ultimoReset(): Promise<UltimoReset | null> {
 }
 
 export async function existeColetaEmAndamento(): Promise<boolean> {
-  const r = await consultarUm<{ existe: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM infoprice.ctl_execucao WHERE status = 'em_execucao'
-     ) AS existe`,
+  return (await execucaoEmAndamento()) !== null;
+}
+
+/** A execução em andamento, se houver — a tela oferece pará-la. */
+export async function execucaoEmAndamento(): Promise<number | null> {
+  const r = await consultarUm<{ id: number }>(
+    `SELECT id FROM infoprice.ctl_execucao WHERE status = 'em_execucao' ORDER BY id DESC LIMIT 1`,
   );
-  return r?.existe ?? false;
+  return r?.id ?? null;
 }
 
 export interface OpcoesReset {
@@ -126,6 +130,8 @@ export interface ResultadoReset {
  * coletas do processo, e o comando de terminal pede o servidor parado.
  */
 export async function zerarBase(opcoes: OpcoesReset): Promise<ResultadoReset> {
+  // Órfãs não têm processo por trás: não precisam bloquear o reset.
+  await encerrarOrfas();
   if (await existeColetaEmAndamento()) {
     throw new Error('já existe uma coleta em andamento · aguarde o término para zerar a base');
   }

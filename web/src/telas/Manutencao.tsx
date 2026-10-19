@@ -17,9 +17,11 @@ import { dataHoraBR, numeroBR } from '../util.js';
  */
 export function Manutencao({
   aoAvisar,
+  aoParar,
   aoZerar,
 }: {
   aoAvisar: (texto: string, erro?: boolean) => void;
+  aoParar: (id: number) => Promise<void>;
   aoZerar: () => void;
 }) {
   const recurso = useRecurso<ResumoBaseResposta>(() => api.resumoBase(), []);
@@ -64,7 +66,22 @@ export function Manutencao({
 
       {d.coletaEmAndamento && (
         <Aviso tag="em andamento" tom="atencao">
-          Há uma coleta em andamento. Aguarde o término para zerar a base.
+          Há uma coleta em andamento
+          {d.idEmAndamento !== null && <> (execução #{d.idEmAndamento})</>}. Pare-a
+          ou aguarde o término para zerar a base.{' '}
+          {d.idEmAndamento !== null && (
+            <button
+              type="button"
+              className="botao botao--miudo"
+              onClick={async () => {
+                await aoParar(d.idEmAndamento!);
+                // A parada leva alguns segundos até um ponto seguro.
+                setTimeout(recurso.recarregar, 3000);
+              }}
+            >
+              Parar coleta
+            </button>
+          )}
         </Aviso>
       )}
 

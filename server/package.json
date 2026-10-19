@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/scripts/seed.ts",
-    "ingest": "tsx src/scripts/ingest.ts",
+    "ingest": "node --import tsx src/scripts/ingest.ts",
     "usuario": "tsx src/scripts/usuario.ts",
     "zerar-base": "tsx src/scripts/zerar-base.ts",
     "gerar-fixtures": "tsx src/scripts/gerar-fixtures.ts",

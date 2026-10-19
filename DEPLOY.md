@@ -290,6 +290,12 @@ npm run migrate --workspace @infoprice/server   # só se houver migração nova
 pm2 restart console-ingestao
 ```
 
+Se o `ecosystem.config.cjs` mudou, o `restart` não relê a configuração: use
+`pm2 delete console-ingestao && pm2 start ecosystem.config.cjs && pm2 save`.
+É o caso da versão que passou a rodar o servidor com `node --import tsx` — o
+que permite que um `pm2 stop` pare uma coleta em curso de forma limpa, em vez
+de deixá-la órfã.
+
 As migrações são protegidas por advisory lock, então rodá-las é seguro mesmo se
 algo já as tiver aplicado.
 

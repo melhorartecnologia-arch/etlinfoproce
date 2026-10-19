@@ -10,6 +10,7 @@ import { rotasAuth } from './api/rotas-auth.js';
 import { rotasUsuarios } from './api/rotas-usuarios.js';
 import { rotasAdmin } from './api/rotas-admin.js';
 import { consultarUm } from './db/pool.js';
+import { cancelarTodasLocais, encerrarOrfas } from './ingest/cancelamento.js';
 
 const app = express();
 
@@ -126,6 +127,13 @@ async function iniciar(): Promise<void> {
     console.warn('');
   }
 
+  // O que ficou em andamento de antes de um reinício não tem mais quem o
+  // termine — e bloquearia toda coleta nova até alguém encerrá-lo.
+  const orfas = await encerrarOrfas();
+  if (orfas > 0) {
+    console.warn(`[main] ${orfas} execução(ões) órfã(s) encerrada(s) como cancelada(s)`);
+  }
+
   iniciarAgendador();
 
   const servidor = app.listen(config.porta, () => {
@@ -141,6 +149,9 @@ async function iniciar(): Promise<void> {
   const encerrar = async (sinal: string) => {
     console.log(`[main] ${sinal} recebido · encerrando`);
     pararAgendador();
+    // Uma coleta em curso é parada num ponto seguro antes de o pool fechar;
+    // sem isto ela ficaria em andamento no banco, órfã.
+    await cancelarTodasLocais(`servidor encerrado (${sinal})`);
     servidor.close();
     await fecharPool();
     process.exit(0);

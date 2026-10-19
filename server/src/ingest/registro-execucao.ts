@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { ETAPAS_PROCESSO } from '@infoprice/shared';
 import type { NivelLog, NomeEtapa } from '@infoprice/shared';
 import { consultarUm, pool } from '../db/pool.js';
+import { encerrarOrfas } from './cancelamento.js';
 
 /**
  * Escreve a trilha de auditoria de uma execução: a linha em ctl_execucao, as
@@ -27,10 +28,14 @@ export class RegistroExecucao {
   }): Promise<RegistroExecucao> {
     const assinatura = crypto.randomBytes(4).toString('hex');
 
+    // Uma execução órfã ocuparia o índice de "uma em andamento por vez" e
+    // faria esta inserção falhar para sempre.
+    await encerrarOrfas();
+
     const linha = await consultarUm<{ id: number }>(
       `INSERT INTO infoprice.ctl_execucao
-         (run_date, tipo, gatilho, assinatura, fonte, tentativa, status, id_usuario)
-       VALUES ($1, $2, $3, $4, $5, $6, 'em_execucao', $7)
+         (run_date, tipo, gatilho, assinatura, fonte, tentativa, status, id_usuario, batimento_em)
+       VALUES ($1, $2, $3, $4, $5, $6, 'em_execucao', $7, now())
        RETURNING id`,
       [
         opcoes.runDate,
@@ -141,6 +146,18 @@ export class RegistroExecucao {
       await this.falharEtapa(nome, msg);
       throw erro;
     }
+  }
+
+  /** Fecha as etapas que ficaram abertas: a em curso como erro, as demais ignoradas. */
+  async encerrarEtapasAbertas(detalhe: string): Promise<void> {
+    await pool.query(
+      `UPDATE infoprice.ctl_execucao_etapa
+          SET status = CASE WHEN status = 'em_curso' THEN 'erro' ELSE 'ignorada' END,
+              detalhe = CASE WHEN status = 'em_curso' THEN $2 ELSE COALESCE(detalhe, 'não executada') END,
+              finalizado_em = COALESCE(finalizado_em, now())
+        WHERE id_execucao = $1 AND status IN ('em_curso', 'pendente')`,
+      [this.id, detalhe],
+    );
   }
 
   async atualizar(campos: Record<string, unknown>): Promise<void> {

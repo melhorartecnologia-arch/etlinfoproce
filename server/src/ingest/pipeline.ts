@@ -22,6 +22,12 @@ import {
   type ContagemMotivo,
 } from './regras-qualidade.js';
 import { RegistroExecucao } from './registro-execucao.js';
+import {
+  ExecucaoCancelada,
+  manterBatimento,
+  registrarExecucao,
+  type ControleCancelamento,
+} from './cancelamento.js';
 import { avaliarPosExecucao, notificarResultado } from '../alertas/index.js';
 
 export interface OpcoesColeta {
@@ -37,7 +43,7 @@ export interface OpcoesColeta {
 
 export interface ResultadoColeta {
   idExecucao: number;
-  status: 'concluida' | 'parcial' | 'falha';
+  status: 'concluida' | 'parcial' | 'falha' | 'cancelada';
   arquivosVistos: number;
   arquivosIngeridos: number;
   linhasStaging: number;
@@ -122,11 +128,15 @@ export async function executarColeta(
 
   const inicio = Date.now();
   let driver: DriverOrigem | null = null;
+  // A parada pode vir da tela, do Ctrl+C ou do desligamento do servidor; o
+  // batimento diz ao banco que esta execução tem um processo vivo por trás.
+  const controle = registrarExecucao(registro.id);
+  const pararBatimento = manterBatimento(registro.id);
 
   try {
     const resultado = await comOrigem(async (d) => {
       driver = d;
-      return await rodarEtapas(registro, d, opcoes);
+      return await rodarEtapas(registro, d, opcoes, controle);
     });
 
     const duracao = Date.now() - inicio;
@@ -139,11 +149,27 @@ export async function executarColeta(
 
     return { ...resultado, idExecucao: registro.id };
   } catch (erro) {
-    const msg = erro instanceof Error ? erro.message : String(erro);
-    await registro.erro(`execução interrompida: ${msg}`);
-    await registro.finalizar('falha', msg);
-    await avaliarPosExecucao(registro.id, runDate);
-    await notificarResultado(registro.id);
+    // Parada pedida: não é falha, não abre incidente nem dispara retentativa.
+    // Uma consulta interrompida no banco chega como erro do PostgreSQL; o
+    // sinal abortado é o que diz que foi parada, e não defeito.
+    const cancelada = erro instanceof ExecucaoCancelada || controle.sinal.aborted;
+    const msg = erro instanceof ExecucaoCancelada
+      ? erro.motivo
+      : erro instanceof Error ? erro.message : String(erro);
+
+    if (cancelada) {
+      const motivo = erro instanceof ExecucaoCancelada ? erro.motivo : 'parada pedida';
+      await registro.warn(
+        `execução cancelada · ${motivo} · arquivos já gravados permanecem; o arquivo em curso foi revertido`,
+      );
+      await registro.encerrarEtapasAbertas('cancelada');
+      await registro.finalizar('cancelada', `cancelada · ${motivo}`);
+    } else {
+      await registro.erro(`execução interrompida: ${msg}`);
+      await registro.finalizar('falha', msg);
+      await avaliarPosExecucao(registro.id, runDate);
+      await notificarResultado(registro.id);
+    }
 
     // O que já havia sido apurado antes da falha continua valendo para o
     // relatório — a transação de dados foi revertida, a trilha não.
@@ -165,7 +191,7 @@ export async function executarColeta(
 
     return {
       idExecucao: registro.id,
-      status: 'falha',
+      status: cancelada ? 'cancelada' : 'falha',
       arquivosVistos: parcial?.arquivos_vistos ?? 0,
       arquivosIngeridos: parcial?.arquivos_ingeridos ?? 0,
       linhasStaging: parcial?.linhas_staging ?? 0,
@@ -177,6 +203,8 @@ export async function executarColeta(
     };
   } finally {
     void driver;
+    pararBatimento();
+    controle.liberar();
   }
 }
 
@@ -184,7 +212,11 @@ async function rodarEtapas(
   registro: RegistroExecucao,
   driver: DriverOrigem,
   opcoes: OpcoesColeta,
+  controle: ControleCancelamento,
 ): Promise<Omit<ResultadoColeta, 'idExecucao'>> {
+  // Pontos seguros de parada: antes de cada etapa e de cada arquivo, e a cada
+  // lote lido durante a carga.
+  const verificar = controle.verificar;
   const runDate = opcoes.runDate;
   const pastaNome = `run=${runDate}`;
 
@@ -201,6 +233,7 @@ async function rodarEtapas(
   });
 
   // ── 2 · Listagem do diretório ─────────────────────────────────────────────
+  await verificar();
   const remotos = await registro.etapa('Listagem do diretório', async () => {
     const pastas = await driver.listarPastas();
     const pasta = pastas.find((p) => p.runDate === runDate);
@@ -252,6 +285,7 @@ async function rodarEtapas(
         remotos,
         config.coleta.paralelismo,
         async (arquivo) => {
+          await verificar();
           const caminhoLocal = path.join(destinoDir, arquivo.nome);
           const bytes = await driver.baixar(arquivo.caminho, caminhoLocal);
           const idArquivo = await marcarBaixado(
@@ -288,8 +322,10 @@ async function rodarEtapas(
   );
 
   // ── 4 · Verificação de integridade ────────────────────────────────────────
+  await verificar();
   await registro.etapa('Verificação de integridade', async () => {
     for (const arquivo of baixados) {
+      await verificar();
       arquivo.sha256 = await hashArquivo(arquivo.caminhoLocal);
       const descompactado = await hashDescompactado(arquivo.caminhoLocal);
       await pool.query(
@@ -318,6 +354,7 @@ async function rodarEtapas(
     let colunas = 0;
 
     for (const arquivo of baixados) {
+      await verificar();
       let recusa: { motivo: string; amostra: string } | null;
       try {
         const info = await lerCabecalho(arquivo.caminhoLocal);
@@ -390,8 +427,9 @@ async function rodarEtapas(
   for (const [i, arquivo] of aptos.entries()) {
     const t0 = Date.now();
     const posicao = `[${i + 1}/${aptos.length}]`;
+    await verificar();
     try {
-      const r = await processarArquivo(registro, arquivo, runDate);
+      const r = await processarArquivo(registro, arquivo, runDate, controle);
 
       totais.arquivosIngeridos += 1;
       totais.linhasStaging += r.linhas;
@@ -419,6 +457,12 @@ async function rodarEtapas(
         );
       }
     } catch (erro) {
+      // Parada pedida no meio do arquivo: ele já foi revertido; a execução
+      // inteira para aqui, sem marcar o arquivo como defeituoso.
+      if (erro instanceof ExecucaoCancelada || controle.sinal.aborted) {
+        await verificar();
+        throw erro;
+      }
       const msg = erro instanceof Error ? erro.message : String(erro);
       totais.comErro += 1;
       await registro.erro(
@@ -479,6 +523,7 @@ async function rodarEtapas(
   );
 
   // ── 9 · Auditoria e watermark ─────────────────────────────────────────────
+  await verificar();
   const watermarkAnterior = await registro.etapa(
     'Auditoria e watermark',
     async () => {
@@ -564,83 +609,90 @@ async function processarArquivo(
   registro: RegistroExecucao,
   arquivo: ArquivoLocal,
   runDate: string,
+  controle: ControleCancelamento,
 ): Promise<ResultadoArquivo> {
   // `longa`: COPY, regras e merge de um arquivo grande passam do teto de 30s
   // aplicado às consultas de tela.
   return emTransacao(async (cliente) => {
-    await limparStagingArquivo(cliente, arquivo.idArquivo);
+    // Com o backend registrado, uma parada interrompe a consulta em curso no
+    // próprio PostgreSQL, em vez de esperar o merge terminar.
+    const { rows } = await cliente.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+    return controle.comPid(rows[0]!.pid, async () => {
+      await limparStagingArquivo(cliente, arquivo.idArquivo);
 
-    const carga = await carregarArquivoEmStaging({
-      cliente,
-      idExecucao: registro.id,
-      idArquivo: arquivo.idArquivo,
-      arquivo: arquivo.nome,
-      caminhoLocal: arquivo.caminhoLocal,
-      runDate,
-      fonte: config.coleta.fonte,
-    });
+      const carga = await carregarArquivoEmStaging({
+        cliente,
+        idExecucao: registro.id,
+        idArquivo: arquivo.idArquivo,
+        arquivo: arquivo.nome,
+        caminhoLocal: arquivo.caminhoLocal,
+        runDate,
+        fonte: config.coleta.fonte,
+        verificar: controle.verificar,
+      });
 
-    // O cabeçalho já foi conferido; esta checagem só pega um arquivo que
-    // mudou de layout entre a validação e a carga.
-    const faltando = COLUNAS_OBRIGATORIAS.filter((c) => !carga.cabecalho.includes(c));
-    if (faltando.length > 0) {
-      throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
-    }
+      // O cabeçalho já foi conferido; esta checagem só pega um arquivo que
+      // mudou de layout entre a validação e a carga.
+      const faltando = COLUNAS_OBRIGATORIAS.filter((c) => !carga.cabecalho.includes(c));
+      if (faltando.length > 0) {
+        throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
+      }
 
-    const lojasNovas = config.coleta.cadastrarLojas
-      ? await cadastrarLojasNovas(cliente, registro.id, arquivo.idArquivo)
-      : 0;
+      const lojasNovas = config.coleta.cadastrarLojas
+        ? await cadastrarLojasNovas(cliente, registro.id, arquivo.idArquivo)
+        : 0;
 
-    const contagens = await aplicarRegrasQualidade(
-      cliente,
-      registro.id,
-      arquivo.idArquivo,
-    );
-    const rejeitadas = contagens.reduce((s, c) => s + c.quantidade, 0);
-
-    const merge = await mergeIncremental(cliente, registro.id, arquivo.idArquivo);
-
-    await cliente.query(
-      `UPDATE infoprice.ctl_execucao_arquivo
-          SET linhas_lidas = $3,
-              linhas_gravadas = $4,
-              linhas_rejeitadas = $5,
-              linhas_inseridas = $6,
-              linhas_atualizadas = $7,
-              destino = 'stg → fact',
-              status = 'ingerido',
-              erro = NULL,
-              ingerido_em = now()
-        WHERE id_execucao = $1 AND id_arquivo = $2`,
-      [
+      const contagens = await aplicarRegrasQualidade(
+        cliente,
         registro.id,
         arquivo.idArquivo,
-        carga.linhas,
-        merge.gravadas,
+      );
+      const rejeitadas = contagens.reduce((s, c) => s + c.quantidade, 0);
+
+      const merge = await mergeIncremental(cliente, registro.id, arquivo.idArquivo);
+
+      await cliente.query(
+        `UPDATE infoprice.ctl_execucao_arquivo
+            SET linhas_lidas = $3,
+                linhas_gravadas = $4,
+                linhas_rejeitadas = $5,
+                linhas_inseridas = $6,
+                linhas_atualizadas = $7,
+                destino = 'stg → fact',
+                status = 'ingerido',
+                erro = NULL,
+                ingerido_em = now()
+          WHERE id_execucao = $1 AND id_arquivo = $2`,
+        [
+          registro.id,
+          arquivo.idArquivo,
+          carga.linhas,
+          merge.gravadas,
+          rejeitadas,
+          merge.inseridas,
+          merge.atualizadas,
+        ],
+      );
+
+      // O inventário guarda só a situação atual do arquivo na origem.
+      await cliente.query(
+        `UPDATE infoprice.ctl_arquivo
+            SET status = 'ingerido', erro = NULL, ingerido_em = now(), atualizado_em = now()
+          WHERE id = $1`,
+        [arquivo.idArquivo],
+      );
+
+      return {
+        linhas: carga.linhas,
         rejeitadas,
-        merge.inseridas,
-        merge.atualizadas,
-      ],
-    );
-
-    // O inventário guarda só a situação atual do arquivo na origem.
-    await cliente.query(
-      `UPDATE infoprice.ctl_arquivo
-          SET status = 'ingerido', erro = NULL, ingerido_em = now(), atualizado_em = now()
-        WHERE id = $1`,
-      [arquivo.idArquivo],
-    );
-
-    return {
-      linhas: carga.linhas,
-      rejeitadas,
-      inseridas: merge.inseridas,
-      atualizadas: merge.atualizadas,
-      recuperadas: carga.recuperadas,
-      malformadas: carga.malformadas,
-      lojasNovas,
-      contagens,
-    };
+        inseridas: merge.inseridas,
+        atualizadas: merge.atualizadas,
+        recuperadas: carga.recuperadas,
+        malformadas: carga.malformadas,
+        lojasNovas,
+        contagens,
+      };
+    });
   }, { longa: true });
 }
 

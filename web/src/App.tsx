@@ -145,6 +145,21 @@ function Console({
     }
   };
 
+  const pararColeta = async (id: number) => {
+    const ok = window.confirm(
+      `Parar a execução #${id}?\n\nOs arquivos já gravados ficam; o arquivo em curso é ` +
+        'revertido e a execução termina como cancelada.',
+    );
+    if (!ok) return;
+    try {
+      const r = await api.cancelarExecucao(id);
+      avisar(r.mensagem);
+    } catch (erro) {
+      avisar(erro instanceof Error ? erro.message : String(erro), true);
+    }
+    recarregarTudo();
+  };
+
   const alternarAgendamento = async () => {
     try {
       const pausado = status.dados?.agendamento.pausado ?? false;
@@ -179,6 +194,7 @@ function Console({
           }
           aoAlternarAgendamento={alternarAgendamento}
           aoColetar={coletarAgora}
+          aoParar={pararColeta}
           aoSair={aoSair}
           aoAvisar={avisar}
         />
@@ -190,6 +206,7 @@ function Console({
             <DetalheExecucao
               id={execucaoAberta}
               podeOperar={podeOperar}
+              aoParar={pararColeta}
               aoVoltar={() => setTela('hoje')}
               aoAvisar={avisar}
               aoRecarregarStatus={recarregarTudo}
@@ -229,6 +246,7 @@ function Console({
           {tela === 'manutencao' && podeAdministrar && (
             <Manutencao
               aoAvisar={avisar}
+              aoParar={pararColeta}
               aoZerar={() => {
                 recarregarTudo();
                 setTela('hoje');

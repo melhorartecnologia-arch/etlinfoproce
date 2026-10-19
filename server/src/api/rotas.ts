@@ -27,6 +27,7 @@ import {
   varredura,
 } from '../agendador/index.js';
 import { executarColeta } from '../ingest/pipeline.js';
+import { pedirCancelamento } from '../ingest/cancelamento.js';
 import { SQL_PERSISTENCIA } from '../ingest/merge-incremental.js';
 import { resolverIncidente } from '../alertas/index.js';
 import {
@@ -86,6 +87,19 @@ rotas.get(
       'SELECT max(visto_em) AS visto_em FROM infoprice.ctl_arquivo',
     );
 
+    const emAndamento = await consultarUm<{
+      id: number;
+      runDate: string;
+      iniciadoEm: string;
+      parando: boolean;
+    }>(
+      `SELECT id, run_date::text AS "runDate", iniciado_em AS "iniciadoEm",
+              cancelamento_solicitado_em IS NOT NULL AS parando
+         FROM infoprice.ctl_execucao
+        WHERE status = 'em_execucao'
+        ORDER BY id DESC LIMIT 1`,
+    );
+
     const resposta: StatusResposta = {
       sftp: {
         host:
@@ -113,6 +127,7 @@ rotas.get(
         banco: config.banco.banco,
         schema: config.banco.schema,
       },
+      emAndamento: emAndamento ?? null,
     };
 
     res.json(resposta);
@@ -398,6 +413,33 @@ rotas.post(
       mensagem: `Coleta manual de run=${runDate} disparada por ${quem}`,
     };
     res.status(202).json(r);
+  }),
+);
+
+/**
+ * Para uma coleta em andamento num ponto seguro: os arquivos já gravados
+ * ficam, o arquivo em curso é revertido, e a execução termina como cancelada.
+ */
+rotas.post(
+  '/execucoes/:id/cancelar',
+  exigirOperador,
+  rota(async (req, res) => {
+    const id = Number(req.params.id);
+    const quem = operador(req);
+    const resultado = await pedirCancelamento(id, quem);
+
+    const mensagens: Record<typeof resultado, string> = {
+      parando: `Parando a execução #${id} · os arquivos já gravados ficam, o arquivo em curso é revertido`,
+      encerrada: `Execução #${id} encerrada · não havia processo ativo executando-a`,
+      pedida: `Parada da execução #${id} pedida · o processo que a executa para em alguns segundos`,
+      nao_esta_em_andamento: `A execução #${id} não está em andamento`,
+    };
+    const r: AcaoResposta = {
+      ok: resultado !== 'nao_esta_em_andamento',
+      mensagem: mensagens[resultado],
+      idExecucao: id,
+    };
+    res.status(resultado === 'nao_esta_em_andamento' ? 409 : 202).json(r);
   }),
 );
 

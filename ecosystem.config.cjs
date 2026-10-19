@@ -21,12 +21,15 @@ module.exports = {
     {
       name: 'console-ingestao',
 
-      // O binário do tsx fica no node_modules da raiz do workspace, e não
-      // dentro de server/.
-      script: path.join(raiz, 'node_modules/tsx/dist/cli.mjs'),
-      args: 'src/main.ts',
+      // O tsx entra como carregador do próprio node (`--import tsx`), e não
+      // como o comando `tsx`: este abre um processo-pai que, ao receber o
+      // sinal de parada do PM2, dá ao filho só 30 ms para responder e depois o
+      // mata com SIGKILL — e uma coleta ocupada não responde a tempo, ficando
+      // órfã em vez de terminar como cancelada. Assim o sinal chega direto.
+      script: 'src/main.ts',
       cwd: path.join(raiz, 'server'),
       interpreter: 'node',
+      node_args: '--import tsx',
 
       /**
        * Uma instância só, de propósito.
