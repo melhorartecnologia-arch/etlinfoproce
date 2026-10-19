@@ -8,6 +8,7 @@ import { iniciarAgendador, pararAgendador } from './agendador/index.js';
 import { rotas } from './api/rotas.js';
 import { rotasAuth } from './api/rotas-auth.js';
 import { rotasUsuarios } from './api/rotas-usuarios.js';
+import { rotasAdmin } from './api/rotas-admin.js';
 import { consultarUm } from './db/pool.js';
 
 const app = express();
@@ -74,6 +75,9 @@ app.use('/api', rotasAuth);
 // do próprio router. Montado num caminho próprio para que esse middleware não
 // alcance o resto da API.
 app.use('/api/usuarios', rotasUsuarios);
+
+// Manutenção da base (zerar o histórico): também só administrador.
+app.use('/api/admin', rotasAdmin);
 
 // Tudo abaixo exige sessão.
 app.use('/api', rotas);

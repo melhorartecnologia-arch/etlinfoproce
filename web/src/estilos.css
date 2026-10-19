@@ -353,6 +353,23 @@ table {
   background: oklch(0.93 0.04 250);
 }
 
+.botao--perigo {
+  border: 0;
+  font-weight: 600;
+  color: white;
+  background: oklch(0.55 0.19 27);
+  padding: 9px 16px;
+}
+
+.botao--perigo:hover:not(:disabled) {
+  background: oklch(0.48 0.19 27);
+}
+
+.zona-perigo {
+  border-color: oklch(0.82 0.08 27);
+  background: oklch(0.985 0.012 27);
+}
+
 .botao--miudo {
   font-size: 11.5px;
   padding: 4px 9px;

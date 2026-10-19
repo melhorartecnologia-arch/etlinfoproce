@@ -16,6 +16,9 @@ import type {
   PrecosResposta,
   QualidadeResposta,
   StatusResposta,
+  ResumoBaseResposta,
+  ZerarBasePedido,
+  ZerarBaseResposta,
 } from '@infoprice/shared';
 
 const BASE = '/api';
@@ -84,6 +87,10 @@ export const api = {
   resetarSenha: (id: number) =>
     enviar<AcaoResposta & { senhaProvisoria: string }>(`/usuarios/${id}/senha`),
   tentativasLogin: () => pegar<TentativaLogin[]>('/usuarios/tentativas'),
+
+  resumoBase: () => pegar<ResumoBaseResposta>('/admin/base'),
+  zerarBase: (pedido: ZerarBasePedido) =>
+    enviar<ZerarBaseResposta>('/admin/base/zerar', pedido),
 
   status: () => pegar<StatusResposta>('/status'),
   painel: (run?: string) =>

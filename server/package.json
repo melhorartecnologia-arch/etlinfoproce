@@ -12,6 +12,7 @@
     "seed": "tsx src/scripts/seed.ts",
     "ingest": "tsx src/scripts/ingest.ts",
     "usuario": "tsx src/scripts/usuario.ts",
+    "zerar-base": "tsx src/scripts/zerar-base.ts",
     "gerar-fixtures": "tsx src/scripts/gerar-fixtures.ts",
     "inspecionar-arquivo": "tsx src/scripts/inspecionar-arquivo.ts",
     "baixar-fontes": "tsx src/scripts/baixar-fontes.ts",

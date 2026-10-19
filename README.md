@@ -41,7 +41,7 @@ Outros comandos: `listar`, `senha` (redefine), `papel`, `desativar`, `ativar`.
 |---|---|
 | `leitor` | ver todas as telas e exportar relatórios |
 | `operador` | o acima, mais coleta manual, reprocessamento, pausar o agendamento, resolver incidentes e baixar arquivos |
-| `administrador` | o acima, mais a gestão de usuários |
+| `administrador` | o acima, mais a gestão de usuários e zerar a base |
 
 A interface esconde o que o papel não alcança, mas quem garante é o servidor:
 cada rota de ação exige o papel na entrada. O último administrador ativo não
@@ -57,6 +57,41 @@ por um administrador nasce provisória: o servidor recusa qualquer ação até q
 a pessoa troque. Cinco falhas de login em 15 minutos travam o usuário — e o
 limite por IP é quatro vezes maior, para não punir um escritório inteiro atrás
 do mesmo NAT. Toda tentativa fica registrada em `ctl_tentativa_login`.
+
+## Zerar a base
+
+Apaga todo o histórico de dados e de metadados e deixa a aplicação como
+recém-instalada. Numa transação só — ou apaga tudo, ou nada.
+
+| Apaga | Mantém |
+|---|---|
+| execuções, etapas e log técnico | schema (as migrações continuam aplicadas) |
+| inventário de arquivos e participações | regras de alerta e agendamento |
+| staging, preços gravados e todas as partições mensais | o registro dos próprios resets (`ctl_reset`) |
+| rejeições e incidentes (o código volta a #201) | usuários e sessões — salvo `--incluir-usuarios` |
+| lojas (`dim_loja`), watermark e tentativas de login | cópias locais dos arquivos — salvo a opção de apagá-las |
+
+**Pela tela** — *administração › Zerar base*, só administrador. Mostra o que
+será apagado, exige digitar `ZERAR TUDO` e a sua senha, e pode apagar também as
+cópias locais dos arquivos. Os usuários ficam: apagá-los pela tela trancaria o
+próprio administrador do lado de fora. É recusado enquanto houver coleta em
+andamento, e nenhuma coleta começa enquanto o reset roda.
+
+**Pelo terminal** — pare o servidor antes (`pm2 stop console-ingestao`):
+
+```bash
+npm run zerar-base --workspace @infoprice/server
+npm run zerar-base --workspace @infoprice/server -- --apagar-arquivos
+npm run zerar-base --workspace @infoprice/server -- --incluir-usuarios --apagar-arquivos
+```
+
+`--incluir-usuarios` apaga também usuários e sessões — a aplicação volta ao
+estado de instalação, e o administrador é criado de novo com `npm run usuario`.
+Sem `--sim`, o comando pede a frase de confirmação.
+
+Atenção às cópias locais: o fornecedor guarda os arquivos por 5 dias. O que for
+mais antigo que isso e for apagado da área temporária não poderá ser baixado de
+novo. Na dúvida, faça um backup do banco antes.
 
 ## Configuração e segredos
 
@@ -376,6 +411,8 @@ run, então uma tentativa que falha três vezes abre um incidente, não três.
 | GET | `/api/inventario/:pasta/download` | pasta inteira em `.tar` |
 | GET | `/api/execucoes/:id/auditoria.csv` \| `.pdf` | relatório de auditoria |
 | GET | `/api/qualidade/rejeicoes.csv`, `/api/precos.csv` | exportações |
+| GET | `/api/admin/base` | o que um reset apagaria (administrador) |
+| POST | `/api/admin/base/zerar` | zera a base: frase + senha (administrador) |
 
 Só uma coleta roda por vez; uma segunda tentativa recebe `409` com a mensagem
 que a tela mostra no toast.

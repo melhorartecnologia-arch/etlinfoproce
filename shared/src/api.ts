@@ -150,3 +150,46 @@ export interface ErroResposta {
   erro: string;
   detalhe?: string;
 }
+
+/** O que existe na base hoje — o que um reset apagaria. */
+export interface ContagensBase {
+  execucoes: number;
+  arquivos: number;
+  /** Estimativa do PostgreSQL: contar o fato inteiro levaria minutos. */
+  precos: number;
+  rejeicoes: number;
+  incidentes: number;
+  lojas: number;
+  eventosLog: number;
+  tentativasLogin: number;
+  usuarios: number;
+}
+
+export interface UltimoReset {
+  executadoEm: string;
+  executadoPor: string;
+  origem: string;
+}
+
+/** GET /api/admin/base */
+export interface ResumoBaseResposta {
+  contagens: ContagensBase;
+  /** Onde ficam as cópias locais dos arquivos baixados. */
+  areaTemporaria: string;
+  /** Frase que precisa ser digitada para confirmar. */
+  frase: string;
+  coletaEmAndamento: boolean;
+  ultimoReset: UltimoReset | null;
+}
+
+/** POST /api/admin/base/zerar */
+export interface ZerarBasePedido {
+  confirmacao: string;
+  senha: string;
+  apagarArquivos: boolean;
+}
+
+export interface ZerarBaseResposta extends AcaoResposta {
+  apagado: ContagensBase;
+  arquivosRemovidos: number;
+}

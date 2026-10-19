@@ -7,7 +7,8 @@ export type Tela =
   | 'qualidade'
   | 'precos'
   | 'config'
-  | 'usuarios';
+  | 'usuarios'
+  | 'manutencao';
 
 export interface ItemNav {
   tela: Tela;
@@ -32,7 +33,10 @@ export function gruposPara(podeAdministrar: boolean): GrupoNav[] {
 
 export const GRUPO_ADMIN: GrupoNav = {
   titulo: 'administração',
-  itens: [{ tela: 'usuarios', rotulo: 'Usuários' }],
+  itens: [
+    { tela: 'usuarios', rotulo: 'Usuários' },
+    { tela: 'manutencao', rotulo: 'Zerar base' },
+  ],
 };
 
 export const GRUPOS_NAV: GrupoNav[] = [

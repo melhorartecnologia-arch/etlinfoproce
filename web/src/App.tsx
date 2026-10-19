@@ -22,6 +22,7 @@ import { Alertas } from './telas/Alertas.js';
 import { Precos } from './telas/Precos.js';
 import { Configuracao } from './telas/Configuracao.js';
 import { Usuarios } from './telas/Usuarios.js';
+import { Manutencao } from './telas/Manutencao.js';
 
 export function App() {
   const [usuario, setUsuario] = useState<UsuarioSessao | null>(null);
@@ -223,6 +224,16 @@ function Console({
 
           {tela === 'usuarios' && podeAdministrar && (
             <Usuarios eu={usuario} aoAvisar={avisar} />
+          )}
+
+          {tela === 'manutencao' && podeAdministrar && (
+            <Manutencao
+              aoAvisar={avisar}
+              aoZerar={() => {
+                recarregarTudo();
+                setTela('hoje');
+              }}
+            />
           )}
         </div>
       </main>
