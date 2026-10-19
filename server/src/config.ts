@@ -129,7 +129,9 @@ export const config = {
     host: texto('SFTP_HOST', 'sftp.exemplo.com.br'),
     porta: numero('SFTP_PORT', 22),
     usuario: texto('SFTP_USUARIO', 'usuario-sftp'),
-    chavePrivada: texto('SFTP_CHAVE_PRIVADA', ''),
+    // Como os demais caminhos do .env, relativo à pasta server/ — e não ao
+    // diretório de onde o processo foi iniciado, que muda entre o PM2 e o npm.
+    chavePrivada: process.env.SFTP_CHAVE_PRIVADA ? caminho('SFTP_CHAVE_PRIVADA', '') : '',
     chavePassphrase: texto('SFTP_CHAVE_PASSPHRASE', ''),
     senha: texto('SFTP_SENHA', ''),
     diretorioBase: texto(

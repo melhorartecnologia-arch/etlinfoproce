@@ -29,7 +29,13 @@ export class SftpRemoto implements DriverOrigem {
     };
 
     if (config.sftp.chavePrivada) {
-      const chave = await fs.readFile(config.sftp.chavePrivada);
+      const chave = await fs.readFile(config.sftp.chavePrivada).catch((erro) => {
+        if ((erro as NodeJS.ErrnoException).code !== 'ENOENT') throw erro;
+        throw new Error(
+          `chave SFTP não encontrada em ${config.sftp.chavePrivada} · confira SFTP_CHAVE_PRIVADA ` +
+            `no .env (caminho absoluto, ou relativo à pasta ${config.raizServidor})`,
+        );
+      });
       return {
         ...base,
         privateKey: chave,
