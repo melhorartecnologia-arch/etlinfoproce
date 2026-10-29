@@ -121,6 +121,13 @@ export const config = {
      * notar.
      */
     timeoutTransacaoOciosaMs: numero('PG_TIMEOUT_TRANSACAO_OCIOSA_MS', 120_000),
+    /**
+     * Quanto a transação de um arquivo espera por um lock antes de desistir.
+     * Sem este teto, um lock preso por outra sessão (uma transação esquecida,
+     * uma coleta anterior cujo processo morreu) deixaria a gravação parada até
+     * PG_TIMEOUT_INGESTAO_MS — uma hora sem nada acontecer na tela.
+     */
+    timeoutLockMs: numero('PG_TIMEOUT_LOCK_MS', 300_000),
   },
 
   sftp: {

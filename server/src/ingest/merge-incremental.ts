@@ -89,8 +89,14 @@ export async function mergeIncremental(
   cliente: Cliente,
   idExecucao: number,
   idArquivo: number,
+  /** Avisado a cada passo do merge, para o acompanhamento da gravação. */
+  aoPasso?: (passo: string) => Promise<void>,
 ): Promise<ResultadoMerge> {
+  // Criar partição pede lock exclusivo na tabela final: se uma consulta longa
+  // a estiver lendo, é aqui que a gravação espera.
+  await aoPasso?.('garantindo partições mensais');
   const particoes = await garantirParticoes(cliente, idExecucao, idArquivo);
+  await aoPasso?.(`upsert · ${particoes.length} partição(ões): ${particoes.join(', ')}`);
 
   const { rows } = await cliente.query<{
     id_arquivo: number;

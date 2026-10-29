@@ -22,6 +22,7 @@ import {
   type ContagemMotivo,
 } from './regras-qualidade.js';
 import { RegistroExecucao } from './registro-execucao.js';
+import { AcompanhamentoArquivo } from './acompanhamento.js';
 import {
   ExecucaoCancelada,
   manterBatimento,
@@ -454,8 +455,16 @@ async function rodarEtapas(
     const t0 = Date.now();
     const posicao = `[${i + 1}/${aptos.length}]`;
     await verificar();
+    const acompanhamento = new AcompanhamentoArquivo(registro, {
+      posicao: i + 1,
+      total: aptos.length,
+      idArquivo: arquivo.idArquivo,
+      nome: arquivo.nome,
+    });
     try {
-      const r = await processarArquivo(registro, arquivo, runDate, controle);
+      await acompanhamento.iniciar();
+      const r = await processarArquivo(registro, arquivo, runDate, controle, acompanhamento);
+      await acompanhamento.encerrar('efetivado');
 
       totais.arquivosIngeridos += 1;
       totais.linhasStaging += r.linhas;
@@ -470,7 +479,8 @@ async function rodarEtapas(
       await registro.info(
         `${posicao} ${arquivo.nome} gravado em ${duracaoBR(Date.now() - t0)} · ` +
           `${numeroBR(r.linhas)} lidas · ${numeroBR(r.rejeitadas)} rejeitadas · ` +
-          `${numeroBR(r.inseridas)} inseridas · ${numeroBR(r.atualizadas)} atualizadas`,
+          `${numeroBR(r.inseridas)} inseridas · ${numeroBR(r.atualizadas)} atualizadas · ` +
+          `tempos: ${acompanhamento.tempos()}`,
       );
       if (r.recuperadas > 0) {
         await registro.warn(
@@ -483,6 +493,8 @@ async function rodarEtapas(
         );
       }
     } catch (erro) {
+      const tempos = acompanhamento.tempos();
+      await acompanhamento.encerrar('revertido');
       // Parada pedida no meio do arquivo: ele já foi revertido; a execução
       // inteira para aqui, sem marcar o arquivo como defeituoso.
       if (erro instanceof ExecucaoCancelada || controle.sinal.aborted) {
@@ -492,7 +504,8 @@ async function rodarEtapas(
       const msg = erro instanceof Error ? erro.message : String(erro);
       totais.comErro += 1;
       await registro.erro(
-        `${posicao} ${arquivo.nome} revertido: ${msg} · os demais arquivos seguem`,
+        `${posicao} ${arquivo.nome} revertido: ${explicarErroBanco(erro, msg)} · ` +
+          `tempos: ${tempos} · os demais arquivos seguem`,
       );
       await marcarArquivoComErro(registro.id, arquivo.idArquivo, msg);
     }
@@ -636,6 +649,7 @@ async function processarArquivo(
   arquivo: ArquivoLocal,
   runDate: string,
   controle: ControleCancelamento,
+  acompanhamento: AcompanhamentoArquivo,
 ): Promise<ResultadoArquivo> {
   // `longa`: COPY, regras e merge de um arquivo grande passam do teto de 30s
   // aplicado às consultas de tela.
@@ -643,8 +657,13 @@ async function processarArquivo(
     // Com o backend registrado, uma parada interrompe a consulta em curso no
     // próprio PostgreSQL, em vez de esperar o merge terminar.
     const { rows } = await cliente.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
-    return controle.comPid(rows[0]!.pid, async () => {
+    const pid = rows[0]!.pid;
+    return controle.comPid(pid, async () => {
+      await acompanhamento.vincular(cliente, pid);
+      await acompanhamento.fase('limpando staging', `backend pid ${pid}`);
       await limparStagingArquivo(cliente, arquivo.idArquivo);
+
+      await acompanhamento.fase('COPY → staging');
 
       const carga = await carregarArquivoEmStaging({
         cliente,
@@ -655,6 +674,7 @@ async function processarArquivo(
         runDate,
         fonte: config.coleta.fonte,
         verificar: controle.verificar,
+        aoProgresso: (linhas) => acompanhamento.linhas(linhas),
       });
 
       // O cabeçalho já foi conferido; esta checagem só pega um arquivo que
@@ -664,18 +684,31 @@ async function processarArquivo(
         throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
       }
 
-      const lojasNovas = config.coleta.cadastrarLojas
-        ? await cadastrarLojasNovas(cliente, registro.id, arquivo.idArquivo)
-        : 0;
+      await acompanhamento.fase('regras de qualidade', `${numeroBR(carga.linhas)} linhas em staging`);
+      let lojasNovas = 0;
+      if (config.coleta.cadastrarLojas) {
+        await acompanhamento.detalhe('cadastrando lojas novas em dim_loja');
+        lojasNovas = await cadastrarLojasNovas(cliente, registro.id, arquivo.idArquivo);
+      }
 
       const contagens = await aplicarRegrasQualidade(
         cliente,
         registro.id,
         arquivo.idArquivo,
+        (motivo, ordem, total) => acompanhamento.detalhe(`${ordem}/${total} ${motivo}`),
       );
       const rejeitadas = contagens.reduce((s, c) => s + c.quantidade, 0);
 
-      const merge = await mergeIncremental(cliente, registro.id, arquivo.idArquivo);
+      await acompanhamento.fase(
+        'merge → fact_preco_coletado',
+        `${numeroBR(carga.linhas - rejeitadas)} linhas aprovadas · ${numeroBR(rejeitadas)} rejeitadas`,
+      );
+      const merge = await mergeIncremental(
+        cliente,
+        registro.id,
+        arquivo.idArquivo,
+        (passo) => acompanhamento.detalhe(passo),
+      );
 
       await cliente.query(
         `UPDATE infoprice.ctl_execucao_arquivo
@@ -708,6 +741,12 @@ async function processarArquivo(
         [arquivo.idArquivo],
       );
 
+      // O COMMIT roda logo depois deste retorno, em emTransacao.
+      await acompanhamento.fase(
+        'COMMIT',
+        `${numeroBR(merge.inseridas)} inseridas · ${numeroBR(merge.atualizadas)} atualizadas`,
+      );
+
       return {
         linhas: carga.linhas,
         rejeitadas,
@@ -720,6 +759,29 @@ async function processarArquivo(
       };
     });
   }, { longa: true });
+}
+
+/**
+ * O erro do PostgreSQL em linguagem de operação. lock_timeout e
+ * statement_timeout chegam como "canceling statement due to …", que não diz
+ * o que fazer.
+ */
+function explicarErroBanco(erro: unknown, msg: string): string {
+  const codigo = (erro as { code?: string } | null)?.code;
+  if (codigo === '55P03') {
+    return (
+      `${msg} · a gravação esperou ${duracaoBR(config.banco.timeoutLockMs)} por um lock ` +
+      'preso por outra sessão (veja no log quem o segurava) · PG_TIMEOUT_LOCK_MS'
+    );
+  }
+  if (codigo === '57014' && /statement timeout/i.test(msg)) {
+    return (
+      `${msg} · uma consulta da gravação passou de ${duracaoBR(config.banco.timeoutIngestaoMs)} · ` +
+      'PG_TIMEOUT_INGESTAO_MS'
+    );
+  }
+  if (codigo === '40P01') return `${msg} · deadlock com outra sessão`;
+  return msg;
 }
 
 /** Marca o arquivo com erro nesta execução e no inventário, fora de transação. */

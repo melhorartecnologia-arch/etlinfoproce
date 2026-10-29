@@ -41,6 +41,8 @@ export interface ParametrosCarga {
   fonte: string;
   /** Chamado a cada lote lido: lança se a parada da coleta foi pedida. */
   verificar?: () => Promise<void>;
+  /** Chamado a cada lote enviado ao COPY, com o total de linhas até ali. */
+  aoProgresso?: (linhas: number) => Promise<void>;
 }
 
 export interface ResultadoCarga {
@@ -93,6 +95,8 @@ export async function carregarArquivoEmStaging(
       ),
     ]);
 
+  let enviadas = 0;
+
   try {
     const resultado = await lerCsv(p.caminhoLocal, async (lote) => {
       await p.verificar?.();
@@ -123,6 +127,8 @@ export async function carregarArquivoEmStaging(
         ]);
         if (!podeContinuar) await esperarVazao();
       }
+      enviadas += lote.length;
+      await p.aoProgresso?.(enviadas);
     });
 
     gerador.end();

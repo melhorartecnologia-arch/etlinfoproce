@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { DetalheExecucaoResposta } from '@infoprice/shared';
 import { api } from '../api.js';
 import { useRecurso } from '../hooks.js';
@@ -12,6 +12,7 @@ import {
   TituloTela,
   Vazio,
 } from '../componentes/base.js';
+import { GravacaoNoBanco } from '../componentes/GravacaoNoBanco.js';
 import {
   abreviarHash,
   bytesBR,
@@ -37,6 +38,9 @@ export function DetalheExecucao({
   aoRecarregarStatus: () => void;
 }) {
   const [mostrarSql, setMostrarSql] = useState(true);
+  // Enquanto a execução roda, a tela se atualiza sozinha: é o que mostra a
+  // gravação avançando (ou parada) sem precisar recarregar a página.
+  const [acompanhar, setAcompanhar] = useState(false);
 
   const recurso = useRecurso<DetalheExecucaoResposta | null>(
     async () => {
@@ -48,7 +52,11 @@ export function DetalheExecucao({
       return ultima ? api.execucao(ultima.id) : null;
     },
     [id],
+    acompanhar ? 5_000 : undefined,
   );
+
+  const emCurso = recurso.dados?.execucao.status === 'em_execucao';
+  useEffect(() => setAcompanhar(emCurso), [emCurso]);
 
   if (recurso.carregando) return <Carregando />;
   if (recurso.erro) {
@@ -171,6 +179,14 @@ export function DetalheExecucao({
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {d.progresso && e.status !== 'concluida' && (
+            <GravacaoNoBanco
+              progresso={d.progresso}
+              aoVivo={d.progressoAoVivo}
+              emCurso={e.status === 'em_execucao'}
+            />
+          )}
+
           <div className="cartao cartao__corpo" style={{ gap: 12 }}>
             <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
               Controle de idempotência
@@ -247,9 +263,15 @@ export function DetalheExecucao({
                   </td>
                   <td className="mono suave">{a.destino ?? '—'}</td>
                   <td>
-                    <Pilula tom={a.status === 'ingerido' ? 'ok' : 'neutro'}>
-                      {a.status === 'ingerido' ? 'Ingerido' : a.status}
-                    </Pilula>
+                    {e.status === 'em_execucao' &&
+                    d.progresso?.pid &&
+                    d.progresso.idArquivo === a.id ? (
+                      <Pilula tom="exec">gravando</Pilula>
+                    ) : (
+                      <Pilula tom={a.status === 'ingerido' ? 'ok' : a.status === 'erro' ? 'erro' : 'neutro'}>
+                        {a.status === 'ingerido' ? 'Ingerido' : a.status}
+                      </Pilula>
+                    )}
                   </td>
                   <td>
                     <div className="acoes">

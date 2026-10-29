@@ -130,6 +130,8 @@ export async function aplicarRegrasQualidade(
   cliente: Cliente,
   idExecucao: number,
   idArquivo: number,
+  /** Avisado antes de cada regra rodar, para o acompanhamento da gravação. */
+  aoRegra?: (motivo: string, ordem: number, total: number) => Promise<void>,
 ): Promise<ContagemMotivo[]> {
   const contagens: ContagemMotivo[] = [];
 
@@ -141,7 +143,9 @@ export async function aplicarRegrasQualidade(
        AND r.numero_linha = s.numero_linha
   )`;
 
-  for (const regra of REGRAS) {
+  const total = REGRAS.length + 1;
+  for (const [i, regra] of REGRAS.entries()) {
+    await aoRegra?.(regra.motivo, i + 1, total);
     const { rowCount } = await cliente.query(
       `INSERT INTO infoprice.ctl_rejeicao
          (id_execucao, id_arquivo, arquivo, numero_linha, motivo, payload, tratamento)
@@ -158,6 +162,7 @@ export async function aplicarRegrasQualidade(
 
   // Duplicidade: mantém a última ocorrência (maior numero_linha) de cada chave
   // e rejeita as anteriores, entre as linhas que sobreviveram às demais regras.
+  await aoRegra?.(REGRA_DUPLICIDADE.motivo, total, total);
   const { rowCount: dup } = await cliente.query(
     `WITH validas AS (
        SELECT s.*,

@@ -394,6 +394,34 @@ volume real. `idle_in_transaction_session_timeout` derruba a sessão que ficar
 parada dentro de uma transação, para que um processo travado não segure locks
 no RDS até alguém notar.
 
+`lock_timeout` vale `PG_TIMEOUT_LOCK_MS` (5 min por padrão) na transação de
+cada arquivo: esperar um lock preso por outra sessão não é trabalhar, e sem
+este teto a gravação ficaria parada pelo `statement_timeout` inteiro. No
+PostgreSQL 14 ou mais novo, `client_connection_check_interval` faz o backend
+abortar quando o processo da coleta morre no meio do merge, em vez de seguir
+até o fim segurando os locks do arquivo.
+
+### Visibilidade da gravação no banco
+
+A transação de cada arquivo (limpeza do staging → COPY → regras → merge →
+COMMIT) é acompanhada enquanto roda:
+
+- o log ganha uma linha a cada fase, com a duração da anterior, e o resumo do
+  arquivo diz onde o tempo foi (`tempos: limpando 0s · COPY 42s · regras 18s ·
+  merge 1m 10s · COMMIT 1s`); o COPY registra as linhas enviadas a cada minuto;
+- a cada 15 s o backend da transação é observado em `pg_stat_activity`. Se ele
+  estiver esperando um lock, o log recebe um WARN com o pid, a aplicação, a
+  idade da transação e a última consulta de quem bloqueia, e o comando para
+  liberar (`SELECT pg_terminate_backend(pid);`). Fase que passa de 2 min sem
+  terminar também é registrada, dizendo se o banco segue trabalhando ou se
+  está ocioso esperando a coleta;
+- o ponto atual fica em `ctl_execucao.progresso`, e a tela de detalhe da
+  execução mostra o cartão **Gravação no banco**, atualizado a cada 5 s, com o
+  retrato ao vivo do backend e de quem o bloqueia. Depois do fim, o cartão
+  mostra o último ponto registrado — onde uma execução interrompida parou;
+- cada transação de arquivo aparece em `pg_stat_activity` como
+  `ingestao exec#<execução> arq#<arquivo>`.
+
 ### Migrações
 
 Rodam na subida, protegidas por um advisory lock: várias tarefas do serviço

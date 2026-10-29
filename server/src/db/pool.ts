@@ -99,6 +99,18 @@ export async function consultarUm<
   return linhas[0] ?? null;
 }
 
+let verificacaoDeCliente: boolean | null = null;
+
+async function temVerificacaoDeCliente(cliente: Cliente): Promise<boolean> {
+  if (verificacaoDeCliente === null) {
+    const { rowCount } = await cliente.query(
+      `SELECT 1 FROM pg_settings WHERE name = 'client_connection_check_interval'`,
+    );
+    verificacaoDeCliente = (rowCount ?? 0) > 0;
+  }
+  return verificacaoDeCliente;
+}
+
 /**
  * Roda o callback dentro de uma transação. Qualquer erro dispara ROLLBACK —
  * é o que garante a promessa de "rollback total em qualquer falha" da tela de
@@ -122,6 +134,15 @@ export async function emTransacao<T>(
       await cliente.query(
         `SET LOCAL idle_in_transaction_session_timeout = ${config.banco.timeoutTransacaoOciosaMs}`,
       );
+      // Esperar um lock não é trabalhar: sem este teto, um lock preso por
+      // outra sessão pararia a gravação pelo statement_timeout inteiro.
+      await cliente.query(`SET LOCAL lock_timeout = ${config.banco.timeoutLockMs}`);
+      // Se o processo morrer no meio do merge, o backend percebe o cliente
+      // ausente e aborta, em vez de seguir até o fim segurando os locks do
+      // arquivo — que travariam a próxima coleta. Só existe a partir do PG 14.
+      if (await temVerificacaoDeCliente(cliente)) {
+        await cliente.query(`SET LOCAL client_connection_check_interval = 10000`);
+      }
     }
 
     const resultado = await fn(cliente);

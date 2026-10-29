@@ -107,6 +107,41 @@ export interface Etapa {
   duracaoMs: number | null;
 }
 
+/** Um backend do PostgreSQL, como pg_stat_activity o mostra. */
+export interface SessaoBanco {
+  pid: number;
+  aplicacao: string | null;
+  /** active, idle in transaction, idle… */
+  estado: string | null;
+  /** wait_event_type: Lock, IO, LWLock, Client… Nulo quando não espera nada. */
+  esperaTipo: string | null;
+  espera: string | null;
+  consultaHaMs: number | null;
+  transacaoHaMs: number | null;
+  consulta: string | null;
+}
+
+/**
+ * Onde a gravação no banco está: o arquivo em curso, a fase dentro dele e o
+ * retrato do backend que executa a transação do arquivo.
+ */
+export interface ProgressoGravacao {
+  posicao: number;
+  total: number;
+  idArquivo: number;
+  arquivo: string;
+  fase: string;
+  faseDesde: string;
+  arquivoDesde: string;
+  linhasLidas: number;
+  /** Backend da transação do arquivo; nulo entre um arquivo e outro. */
+  pid: number | null;
+  atualizadoEm: string;
+  banco: SessaoBanco | null;
+  /** Quem segura o lock que a transação espera (pg_blocking_pids). */
+  bloqueadores: SessaoBanco[];
+}
+
 export interface EventoLog {
   id: number;
   ts: string;

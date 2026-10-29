@@ -8,6 +8,7 @@ import type {
   LinhagemArquivo,
   PastaInventario,
   Preco,
+  ProgressoGravacao,
   RegraAlerta,
   StatusExecucao,
 } from '@infoprice/shared';
@@ -69,6 +70,15 @@ export async function execucaoDoRun(runDate: string): Promise<Execucao | null> {
   );
 }
 
+/** O último progresso gravado da gravação no banco (ctl_execucao.progresso). */
+export async function progressoDaExecucao(id: number): Promise<ProgressoGravacao | null> {
+  const linha = await consultarUm<{ progresso: ProgressoGravacao | null }>(
+    'SELECT progresso FROM infoprice.ctl_execucao WHERE id = $1',
+    [id],
+  );
+  return linha?.progresso ?? null;
+}
+
 export async function etapasDaExecucao(id: number): Promise<Etapa[]> {
   return consultar<Etapa>(
     `SELECT ordem, nome, detalhe, status,
@@ -82,16 +92,25 @@ export async function etapasDaExecucao(id: number): Promise<Etapa[]> {
   );
 }
 
+/**
+ * Os `limite` eventos mais recentes, em ordem cronológica. Com a gravação
+ * registrando cada fase de cada arquivo, uma execução longa passa de algumas
+ * centenas de eventos — e o que importa ver é onde ela está agora.
+ */
 export async function logDaExecucao(
   id: number,
   limite = 200,
 ): Promise<{ eventos: EventoLog[]; total: number }> {
   const eventos = await consultar<EventoLog>(
     `SELECT id, ts, nivel, mensagem
-       FROM infoprice.ctl_execucao_log
-      WHERE id_execucao = $1
-      ORDER BY id
-      LIMIT $2`,
+       FROM (
+         SELECT id, ts, nivel, mensagem
+           FROM infoprice.ctl_execucao_log
+          WHERE id_execucao = $1
+          ORDER BY id DESC
+          LIMIT $2
+       ) recentes
+      ORDER BY id`,
     [id, limite],
   );
 

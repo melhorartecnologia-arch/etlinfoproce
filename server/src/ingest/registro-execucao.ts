@@ -149,6 +149,16 @@ export class RegistroExecucao {
   }
 
   /** Fecha as etapas que ficaram abertas: a em curso como erro, as demais ignoradas. */
+  /** Troca o detalhe de uma etapa em curso, para o painel mostrar o avanço. */
+  async detalharEtapa(nome: NomeEtapa, detalhe: string): Promise<void> {
+    await pool.query(
+      `UPDATE infoprice.ctl_execucao_etapa
+          SET detalhe = $3
+        WHERE id_execucao = $1 AND ordem = $2 AND status = 'em_curso'`,
+      [this.id, this.ordemDe(nome), detalhe],
+    );
+  }
+
   async encerrarEtapasAbertas(detalhe: string): Promise<void> {
     await pool.query(
       `UPDATE infoprice.ctl_execucao_etapa

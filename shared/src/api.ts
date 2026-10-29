@@ -9,6 +9,7 @@ import type {
   Incidente,
   LinhagemArquivo,
   PastaInventario,
+  ProgressoGravacao,
   Preco,
   RegraAlerta,
   Rejeicao,
@@ -73,6 +74,13 @@ export interface DetalheExecucaoResposta {
   log: EventoLog[];
   totalEventos: number;
   arquivos: Arquivo[];
+  /**
+   * A gravação no banco: ao vivo enquanto a execução roda; depois dela, o
+   * último ponto registrado — onde uma execução interrompida parou.
+   */
+  progresso: ProgressoGravacao | null;
+  /** O retrato do banco em `progresso` foi tirado agora, nesta resposta. */
+  progressoAoVivo: boolean;
 }
 
 /** GET /api/execucoes/:id/linhagem */

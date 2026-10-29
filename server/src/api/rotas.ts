@@ -29,6 +29,7 @@ import {
 } from '../agendador/index.js';
 import { executarColeta } from '../ingest/pipeline.js';
 import { pedirCancelamento } from '../ingest/cancelamento.js';
+import { retratoBackend } from '../ingest/acompanhamento.js';
 import { listarRuns, tipoDaCarga } from './runs.js';
 import { COLUNAS_ORIGEM } from '../ingest/colunas-origem.js';
 import {
@@ -350,11 +351,25 @@ rotas.get(
       return;
     }
 
-    const [etapas, log, arquivos] = await Promise.all([
+    const [etapas, log, arquivos, progresso] = await Promise.all([
       q.etapasDaExecucao(id),
-      q.logDaExecucao(id, inteiro(req.query.log, 200)),
+      q.logDaExecucao(id, inteiro(req.query.log, 300)),
       q.arquivosDaExecucao(id),
+      q.progressoDaExecucao(id),
     ]);
+
+    // Com a gravação em curso, o retrato do backend é tirado agora, e não o
+    // que o vigia gravou há até 15 s: é o que diz se o banco está trabalhando
+    // ou parado num lock no momento em que o operador olha.
+    let progressoAoVivo = false;
+    if (progresso?.pid && execucao.status === 'em_execucao') {
+      const retrato = await retratoBackend(progresso.pid).catch(() => null);
+      if (retrato) {
+        progresso.banco = retrato.sessao;
+        progresso.bloqueadores = retrato.bloqueadores;
+        progressoAoVivo = true;
+      }
+    }
 
     const resposta: DetalheExecucaoResposta = {
       execucao,
@@ -363,7 +378,8 @@ rotas.get(
           ? `Execução interrompida após ${duracaoBR(execucao.duracaoMs)} · ${execucao.erro ?? 'sem detalhe'}`
           : `${q.rotuloTipo(execucao.tipo)} ${q.concordancia(execucao.tipo, execucao.status)} em ${duracaoBR(
               execucao.duracaoMs,
-            )} · ${numeroBR(execucao.linhasGravadas)} linhas efetivadas em uma única transação`,
+            )} · ${numeroBR(execucao.linhasGravadas)} linhas efetivadas · ` +
+            `${execucao.arquivosIngeridos} de ${execucao.arquivosVistos} arquivos, uma transação por arquivo`,
       cards: [
         {
           rotulo: 'gatilho',
@@ -408,6 +424,8 @@ rotas.get(
       log: log.eventos,
       totalEventos: log.total,
       arquivos,
+      progresso,
+      progressoAoVivo,
     };
 
     res.json(resposta);
