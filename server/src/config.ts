@@ -179,18 +179,6 @@ export const config = {
      */
     hashDescompactado: booleano('HASH_DESCOMPACTADO', false),
     /**
-     * Em quantas conexões cada arquivo é gravado ao mesmo tempo. Um INSERT
-     * usa um núcleo do PostgreSQL só: as partes somam os demais. Use o número
-     * de vCPUs da instância (no RDS, a classe diz quantas).
-     */
-    partesPorArquivo: numero('GRAVACAO_PARTES', 4),
-    /**
-     * Quantos arquivos são gravados ao mesmo tempo. Com as partes já ocupando
-     * os núcleos, 1 deixa cada arquivo mais rápido; mais que 1 só compensa com
-     * núcleos sobrando. Arquivos × partes precisa caber em PGPOOL_MAX.
-     */
-    paralelismoGravacao: numero('GRAVACAO_PARALELISMO', 1),
-    /**
      * Nomes de coluna do arquivo que diferem dos usados aqui, no formato
      * "coluna_interna=nome_no_arquivo" separados por vírgula
      * (ex.: "gtin=cd_ean,preco=vl_preco"). Somam-se aos sinônimos embutidos.

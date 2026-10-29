@@ -6,7 +6,7 @@ import type { RegistroExecucao } from './registro-execucao.js';
 /**
  * Visibilidade da gravação no banco.
  *
- * A gravação de um arquivo (COPY, partições, gravação no fato em partes)
+ * A transação de um arquivo (COPY, gravação no fato, COMMIT)
  * pode levar minutos, e até aqui o log só ganhava uma linha quando ela
  * terminava. Este módulo diz, enquanto ela roda, em que fase está, quantas
  * linhas já foram enviadas e o que o backend do PostgreSQL está fazendo — e,
@@ -84,24 +84,6 @@ export async function retratoBackend(
   return { sessao, bloqueadores };
 }
 
-/**
- * O retrato de um arquivo gravado por vários backends ao mesmo tempo: a sessão
- * mostrada é a que está bloqueada (se houver), e os bloqueadores são a soma
- * dos de todas.
- */
-export async function retratoDosBackends(
-  pids: number[],
-): Promise<{ sessao: SessaoBanco; bloqueadores: SessaoBanco[] } | null> {
-  const retratos = (await Promise.all(pids.map((p) => retratoBackend(p)))).filter(
-    (r): r is NonNullable<typeof r> => r !== null,
-  );
-  if (retratos.length === 0) return null;
-  const bloqueadores = new Map<number, SessaoBanco>();
-  for (const r of retratos) for (const b of r.bloqueadores) bloqueadores.set(b.pid, b);
-  const principal = retratos.find((r) => r.bloqueadores.length > 0) ?? retratos[0]!;
-  return { sessao: principal.sessao, bloqueadores: [...bloqueadores.values()] };
-}
-
 /** "Lock:transactionid", "IO:DataFileRead"… ou o estado, quando não espera. */
 export function descreverEspera(s: SessaoBanco): string {
   if (s.esperaTipo) return `${s.esperaTipo}:${s.espera ?? '?'}`;
@@ -119,11 +101,14 @@ export function descreverBloqueador(b: SessaoBanco): string {
 }
 
 /** As fases da transação de um arquivo, na ordem em que rodam. */
-export type Fase = 'COPY → tabela de carga' | 'partições' | 'gravação → fact_preco_coletado';
+export type Fase =
+  | 'COPY → tabela temporária'
+  | 'gravação → fact_preco_coletado'
+  | 'COMMIT';
 
 /** Em que etapa do painel cada fase da gravação se encaixa. */
 function etapaDaFase(fase: Fase): NomeEtapa {
-  return fase === 'COPY → tabela de carga' ? 'Carga em staging' : 'Merge incremental';
+  return fase === 'COPY → tabela temporária' ? 'Carga em staging' : 'Merge incremental';
 }
 
 /**
@@ -144,8 +129,6 @@ export class AcompanhamentoArquivo {
   private ultimoAviso = 0;
   private ultimosBloqueadores = '';
   private readonly duracoes = new Map<Fase, number>();
-  /** Backends com transação deste arquivo em curso. */
-  private readonly pids = new Set<number>();
   private readonly prefixo: string;
 
   constructor(
@@ -164,7 +147,6 @@ export class AcompanhamentoArquivo {
       arquivoDesde: agora,
       linhasLidas: 0,
       pid: null,
-      pids: [],
       atualizadoEm: agora,
       banco: null,
       bloqueadores: [],
@@ -177,38 +159,19 @@ export class AcompanhamentoArquivo {
   }
 
   /**
-   * Uma transação do arquivo abriu no backend `pid`: registra e passa a
-   * observá-lo. O nome da aplicação fica com a execução, o arquivo e a parte,
-   * para quem olhar pg_stat_activity direto no banco saber de quem é cada
-   * sessão.
+   * A transação abriu no backend `pid`: registra e passa a observá-lo. O
+   * nome da aplicação fica com a execução e o arquivo, para quem olhar
+   * pg_stat_activity direto no banco saber de quem é cada sessão.
    */
-  async vincular(
-    cliente: { query: (sql: string, v?: unknown[]) => Promise<unknown> },
-    pid: number,
-    rotulo: string,
-  ): Promise<void> {
+  async vincular(cliente: { query: (sql: string, v?: unknown[]) => Promise<unknown> }, pid: number): Promise<void> {
     await cliente.query(`SELECT set_config('application_name', $1, true)`, [
-      `ingestao exec#${this.registro.id} arq#${this.progresso.idArquivo} ${rotulo}`,
+      `ingestao exec#${this.registro.id} arq#${this.progresso.idArquivo}`,
     ]);
-    this.pids.add(pid);
-    this.atualizarPids();
+    this.progresso.pid = pid;
     await this.persistir();
 
-    if (!this.vigia) {
-      this.vigia = setInterval(() => void this.observar(), INTERVALO_VIGIA_MS);
-      this.vigia.unref();
-    }
-  }
-
-  /** A transação do backend `pid` terminou. */
-  desvincular(pid: number): void {
-    this.pids.delete(pid);
-    this.atualizarPids();
-  }
-
-  private atualizarPids(): void {
-    this.progresso.pids = [...this.pids];
-    this.progresso.pid = this.progresso.pids[0] ?? null;
+    this.vigia = setInterval(() => void this.observar(), INTERVALO_VIGIA_MS);
+    this.vigia.unref();
   }
 
   /**
@@ -266,7 +229,7 @@ export class AcompanhamentoArquivo {
     }
   }
 
-  /** "COPY 1s · partições 1s · gravação 9s" — onde o tempo do arquivo foi. */
+  /** "COPY 1s · gravação 17s · COMMIT 0s" — onde o tempo do arquivo foi. */
   tempos(): string {
     if (this.faseAtual) this.duracoes.set(this.faseAtual, Date.now() - this.inicioFase);
     return [...this.duracoes]
@@ -282,19 +245,19 @@ export class AcompanhamentoArquivo {
     const ms = Date.now() - this.inicioArquivo;
     this.progresso.fase = `${fechamento} · ${duracaoBR(ms)} no arquivo`;
     this.progresso.faseDesde = new Date().toISOString();
-    this.pids.clear();
-    this.atualizarPids();
+    this.progresso.pid = null;
     this.progresso.banco = null;
     this.progresso.bloqueadores = [];
     await this.persistir();
   }
 
-  /** O vigia: um retrato dos backends a cada INTERVALO_VIGIA_MS. */
+  /** O vigia: um retrato do backend a cada INTERVALO_VIGIA_MS. */
   private async observar(): Promise<void> {
-    if (this.pids.size === 0) return;
+    const pid = this.progresso.pid;
+    if (pid === null) return;
     try {
-      const retrato = await retratoDosBackends([...this.pids]);
-      if (!retrato || this.pids.size === 0) return;
+      const retrato = await retratoBackend(pid);
+      if (!retrato || this.progresso.pid === null) return;
       this.progresso.banco = retrato.sessao;
       this.progresso.bloqueadores = retrato.bloqueadores;
       await this.persistir();
@@ -331,7 +294,7 @@ export class AcompanhamentoArquivo {
           ocioso ? 'WARN' : 'INFO',
           `${this.prefixo} · ${this.faseAtual ?? 'gravação'} há ${duracaoBR(naFase)} · ` +
             `backend pid ${s.pid} ${descreverEspera(s)}` +
-            (this.faseAtual === 'COPY → tabela de carga'
+            (this.faseAtual === 'COPY → tabela temporária'
               ? ` · ${numeroBR(this.progresso.linhasLidas)} linhas enviadas`
               : '') +
             (ocioso

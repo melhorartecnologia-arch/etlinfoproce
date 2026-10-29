@@ -175,16 +175,17 @@ A coleta roda em dez etapas, as mesmas que aparecem no painel:
 | 3 | Download para área temporária | baixa em paralelo para `var/spool/infoprice` |
 | 4 | Verificação de integridade | SHA-256 do arquivo, em paralelo (do conteúdo descompactado só com `HASH_DESCOMPACTADO=true`) |
 | 5 | Validação de schema | confere só o cabeçalho de cada arquivo, antes de carregar |
-| 6 | Carga em staging | `COPY` nativo do PostgreSQL para uma tabela de carga (UNLOGGED) por arquivo |
+| 6 | Carga em staging | `COPY` nativo do PostgreSQL para uma tabela temporária por arquivo |
 | 7 | Regras de qualidade | desligadas: aparece como ignorada |
-| 8 | Merge incremental | `UPSERT` em `fact_preco_coletado`, cada arquivo dividido em partes gravadas em paralelo |
+| 8 | Merge incremental | um `UPSERT` por arquivo em `fact_preco_coletado`, um arquivo por vez |
 | 9 | Auditoria e watermark | fecha `ctl_execucao` e avança `ctl_watermark` |
 | 10 | Notificação | resumo no painel e por e-mail |
 
-As etapas 6 a 8 rodam **arquivo a arquivo**, e cada arquivo é gravado por
-`GRAVACAO_PARTES` conexões ao mesmo tempo (4 por padrão). O que já foi gravado
-fica gravado — uma falha no arquivo 30 não desfaz os 29 anteriores, os demais
-seguem, a execução fecha como parcial e a varredura tenta o arquivo de novo. O painel mostra o avanço a cada arquivo, e o log registra uma linha por
+As etapas 6 a 8 rodam **um arquivo por vez, cada um numa transação só**: o
+arquivo é gravado inteiro ou não é gravado. O que já foi gravado fica
+gravado — uma falha no arquivo 30 reverte só o arquivo 30, os
+demais seguem, a execução fecha como parcial e a varredura tenta o arquivo de
+novo. O painel mostra o avanço a cada arquivo, e o log registra uma linha por
 arquivo gravado (lidas, inseridas, atualizadas, não gravadas, linhas/s e o
 tempo de cada fase). O log é gravado fora das transações e sobrevive para
 explicar qualquer falha.
@@ -194,21 +195,13 @@ explicar qualquer falha.
 O arquivo vai do disco para a tabela final sem passar por regras de qualidade:
 
 1. o próprio PostgreSQL lê o CSV (`COPY` nativo, `|`, nulo `\N`, escape `\"`
-   do Spark) para uma tabela de carga UNLOGGED (`infoprice.tmp_carga_*`), com
-   uma coluna por coluna do arquivo. Sem índice e sem WAL, é a escrita mais
-   barata que o banco oferece, e as outras conexões a enxergam;
-2. `GRAVACAO_PARTES` conexões gravam o arquivo no fato ao mesmo tempo, cada uma
-   com um `INSERT … SELECT … ON CONFLICT` sobre uma parte das chaves (hash do
-   GTIN). Um INSERT usa um núcleo do banco só; as partes somam os demais, e a
-   mesma chave cai sempre na mesma parte, então elas nunca se esperam. Número e
-   data no formato comum convertem direto na consulta; só o que foge dele
-   (vírgula decimal, `dd/mm/aaaa`) passa pelas funções `infoprice.para_numero`
-   e `para_data`.
-
-Cada parte é uma transação: se uma falhar, as outras podem já ter gravado. O
-arquivo fica com erro, e reprocessá-lo completa o que faltou — o `UPSERT` só
-reescreve o que mudou. A tabela de carga é apagada ao fim de cada arquivo; a
-que sobrar de um processo que morreu é apagada na subida do servidor.
+   do Spark) para uma tabela temporária com uma coluna por coluna do arquivo.
+   Tabela temporária não tem índice nem WAL — é a escrita mais barata que o
+   banco oferece;
+2. um único `INSERT … SELECT … ON CONFLICT` converte e grava o arquivo inteiro
+   no fato. Número e data no formato comum convertem direto na consulta; só o
+   que foge dele (vírgula decimal, `dd/mm/aaaa`) passa pelas funções
+   `infoprice.para_numero` e `para_data`.
 
 Nada é validado além do que a tabela exige para aceitar a linha: GTIN, loja e
 data legíveis e um preço que caiba em `numeric(12,2)`. A linha sem isso não tem
@@ -219,14 +212,16 @@ Se o `COPY` nativo recusar um arquivo (aspas fora do padrão, byte inválido), e
 é relido pelo leitor tolerante em Node — mais lento, mesmo resultado —, e o log
 diz qual arquivo passou por isso.
 
-As partições mensais dos últimos 24 meses e do mês seguinte são criadas antes
-da gravação, e as que um arquivo ainda precisar, antes das partes começarem —
-sempre cada uma na sua transação curta: criar partição trava a tabela final.
+A gravação tenta primeiro o caminho mais curto: sem deduplicar e sem procurar
+os meses do arquivo. Se o arquivo repetir uma chave, ela refaz ficando com a
+última ocorrência; se trouxer data sem partição, cria a partição e refaz — e o
+log diz quando isso aconteceu. As partições mensais dos últimos 24 meses e do
+mês seguinte são criadas antes da gravação, cada uma na sua transação curta: criar partição trava a tabela
+final, e dentro da gravação de um arquivo deixaria as telas de preço esperando
+o arquivo terminar.
 
 | Variável | Padrão | |
 |---|---|---|
-| `GRAVACAO_PARTES` | 4 | conexões gravando cada arquivo; use o número de vCPUs do banco |
-| `GRAVACAO_PARALELISMO` | 1 | arquivos ao mesmo tempo; só compensa com núcleos sobrando. Arquivos × partes precisa caber em `PGPOOL_MAX` (menos 3) |
 | `PG_MEMORIA_CARGA` | 256MB | `work_mem` da transação de carga |
 | `HASH_DESCOMPACTADO` | false | SHA-256 também do conteúdo descompactado (lê a pasta mais uma vez) |
 
@@ -235,11 +230,7 @@ Medido com arquivos de 400 mil linhas e 44 colunas, numa máquina de 4 núcleos:
 | | por arquivo | 4 arquivos |
 |---|---|---|
 | staging + 8 regras + merge (antes) | 62 s | ~250 s |
-| carga direta, uma transação por arquivo | 20 s | 85 s |
-| carga direta, cada arquivo em 4 partes | **10 s** | **40 s** |
-| reprocessar o mesmo dia (4 partes) | 7 s | 29 s |
-
-O arquivo que cai no leitor tolerante leva ~36 s: a leitura em Node é o limite.
+| carga direta, um arquivo por vez | 18–23 s | 85 s |
 
 A etapa 5 confere o cabeçalho de todos os arquivos antes de carregar qualquer
 linha, então um layout errado é recusado em segundos, com a primeira linha do

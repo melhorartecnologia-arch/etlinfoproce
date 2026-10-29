@@ -29,7 +29,7 @@ import {
 } from '../agendador/index.js';
 import { executarColeta } from '../ingest/pipeline.js';
 import { pedirCancelamento } from '../ingest/cancelamento.js';
-import { retratoDosBackends } from '../ingest/acompanhamento.js';
+import { retratoBackend } from '../ingest/acompanhamento.js';
 import { listarRuns, tipoDaCarga } from './runs.js';
 import { COLUNAS_ORIGEM } from '../ingest/colunas-origem.js';
 import {
@@ -365,7 +365,7 @@ rotas.get(
     if (execucao.status === 'em_execucao') {
       for (const item of progresso) {
         if (!item.pid) continue;
-        const retrato = await retratoDosBackends(item.pids ?? [item.pid]).catch(() => null);
+        const retrato = await retratoBackend(item.pid).catch(() => null);
         if (retrato) {
           item.banco = retrato.sessao;
           item.bloqueadores = retrato.bloqueadores;

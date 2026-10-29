@@ -11,7 +11,6 @@ import { rotasUsuarios } from './api/rotas-usuarios.js';
 import { rotasAdmin } from './api/rotas-admin.js';
 import { consultarUm } from './db/pool.js';
 import { cancelarTodasLocais, encerrarOrfas } from './ingest/cancelamento.js';
-import { apagarTabelasDeCargaOrfas } from './ingest/carga-rapida.js';
 
 const app = express();
 
@@ -133,10 +132,6 @@ async function iniciar(): Promise<void> {
   const orfas = await encerrarOrfas();
   if (orfas > 0) {
     console.warn(`[main] ${orfas} execução(ões) órfã(s) encerrada(s) como cancelada(s)`);
-  }
-  const tabelas = await apagarTabelasDeCargaOrfas();
-  if (tabelas > 0) {
-    console.warn(`[main] ${tabelas} tabela(s) de carga de execuções encerradas apagada(s)`);
   }
 
   iniciarAgendador();
