@@ -468,9 +468,23 @@ async function rodarEtapas(
   // demais. Dois arquivos com a mesma chave podem se esperar ou travar um ao
   // outro (deadlock); o que perder fica para o fim e é regravado sozinho.
   const paralelo = Math.max(1, Math.trunc(config.coleta.paralelismoGravacao));
-  if (paralelo > 1) {
-    await registro.info(`gravação em paralelo · ${paralelo} arquivos por vez`);
+  // Cada parte ocupa uma conexão do pool até o fim; o resto do pool fica para
+  // o log, o progresso e as telas. Sem esta conta, as partes esperariam por
+  // conexão e a gravação ficaria mais lenta, não mais rápida.
+  const folga = Math.max(1, config.banco.maxConexoes - 3);
+  let partes = Math.max(1, Math.trunc(config.coleta.partesPorArquivo));
+  if (paralelo * partes > folga) {
+    const pedidas = partes;
+    partes = Math.max(1, Math.floor(folga / paralelo));
+    await registro.warn(
+      `${paralelo} arquivo(s) × ${pedidas} partes não cabem no pool de ${config.banco.maxConexoes} ` +
+        `conexões (PGPOOL_MAX) · gravando em ${partes} parte(s) por arquivo`,
+    );
   }
+  await registro.info(
+    `gravação · ${partes} parte(s) por arquivo` +
+      (paralelo > 1 ? ` · ${paralelo} arquivos por vez` : ''),
+  );
 
   // Criar partição trava a tabela final inteira até o fim da transação que a
   // criou. Feito dentro da gravação de um arquivo, pararia os demais arquivos
@@ -497,7 +511,7 @@ async function rodarEtapas(
     let resultado: 'ok' | 'adiado' | 'erro' = 'ok';
     try {
       await acompanhamento.iniciar();
-      const r = await processarArquivo(registro, arquivo, controle, acompanhamento);
+      const r = await processarArquivo(registro, arquivo, controle, acompanhamento, partes);
       await acompanhamento.encerrar('efetivado');
 
       totais.arquivosIngeridos += 1;
@@ -658,87 +672,76 @@ async function rodarEtapas(
 }
 
 /**
- * Leva um arquivo direto à tabela final, numa transação só: COPY nativo para
- * uma tabela temporária, um UPSERT no fato e a trilha do arquivo. Qualquer
- * falha reverte apenas este arquivo.
+ * Leva um arquivo direto à tabela final: COPY nativo para a tabela de carga,
+ * o UPSERT no fato em partes paralelas e, por fim, a trilha do arquivo.
  */
 async function processarArquivo(
   registro: RegistroExecucao,
   arquivo: ArquivoLocal,
   controle: ControleCancelamento,
   acompanhamento: AcompanhamentoArquivo,
+  partes: number,
 ): Promise<ResultadoCargaRapida> {
-  // `longa`: o UPSERT de um arquivo grande passa do teto de 30s aplicado às
-  // consultas de tela.
-  return emTransacao(async (cliente) => {
+  await acompanhamento.fase('COPY → tabela de carga');
+
+  const carga = await carregarArquivoRapido({
+    idExecucao: registro.id,
+    idArquivo: arquivo.idArquivo,
+    caminhoLocal: arquivo.caminhoLocal,
+    fonte: config.coleta.fonte,
+    partes,
+    verificar: controle.verificar,
     // Com o backend registrado, uma parada interrompe a consulta em curso no
     // próprio PostgreSQL, em vez de esperar a gravação terminar.
-    const { rows } = await cliente.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
-    const pid = rows[0]!.pid;
-    return controle.comPid(pid, async () => {
-      await acompanhamento.vincular(cliente, pid);
-      await acompanhamento.fase('COPY → tabela temporária', `backend pid ${pid}`);
-
-      const carga = await carregarArquivoRapido({
-        cliente,
-        idExecucao: registro.id,
-        idArquivo: arquivo.idArquivo,
-        caminhoLocal: arquivo.caminhoLocal,
-        fonte: config.coleta.fonte,
-        verificar: controle.verificar,
-        aoProgresso: (linhas) => acompanhamento.linhas(linhas),
-        aoPasso: (passo, detalhe) =>
-          passo === 'partições'
-            ? acompanhamento.fase('partições')
-            : acompanhamento.fase('gravação → fact_preco_coletado', detalhe),
-        aoReler: async (motivo) => {
-          await registro.warn(
-            `${arquivo.nome}: o COPY nativo recusou o arquivo (${motivo.slice(0, 300)}) · ` +
-              'relendo com o leitor tolerante',
-          );
-          await acompanhamento.detalhe('leitor tolerante');
-        },
-      });
-
-      // O cabeçalho já foi conferido; esta checagem só pega um arquivo que
-      // mudou de layout entre a validação e a carga.
-      const faltando = COLUNAS_OBRIGATORIAS.filter((c) => !carga.cabecalho.includes(c));
-      if (faltando.length > 0) {
-        throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
-      }
-
-      const gravadas = carga.inseridas + carga.atualizadas;
-      await cliente.query(
-        `UPDATE infoprice.ctl_execucao_arquivo
-            SET linhas_lidas = $3,
-                linhas_gravadas = $4,
-                linhas_rejeitadas = 0,
-                linhas_inseridas = $5,
-                linhas_atualizadas = $6,
-                destino = 'copy → fact',
-                status = 'ingerido',
-                erro = NULL,
-                ingerido_em = now()
-          WHERE id_execucao = $1 AND id_arquivo = $2`,
-        [registro.id, arquivo.idArquivo, carga.linhas, gravadas, carga.inseridas, carga.atualizadas],
+    comPid: controle.comPid,
+    aoAbrir: (cliente, pid, rotulo) => acompanhamento.vincular(cliente, pid, rotulo),
+    aoFechar: (pid) => acompanhamento.desvincular(pid),
+    aoProgresso: (linhas) => acompanhamento.linhas(linhas),
+    aoPasso: (passo, detalhe) =>
+      passo === 'partições'
+        ? acompanhamento.fase('partições')
+        : acompanhamento.fase('gravação → fact_preco_coletado', detalhe),
+    aoReler: async (motivo) => {
+      await registro.warn(
+        `${arquivo.nome}: o COPY nativo recusou o arquivo (${motivo.slice(0, 300)}) · ` +
+          'relendo com o leitor tolerante',
       );
+      await acompanhamento.detalhe('leitor tolerante');
+    },
+  });
 
-      // O inventário guarda só a situação atual do arquivo na origem.
-      await cliente.query(
-        `UPDATE infoprice.ctl_arquivo
-            SET status = 'ingerido', erro = NULL, ingerido_em = now(), atualizado_em = now()
-          WHERE id = $1`,
-        [arquivo.idArquivo],
-      );
+  // O cabeçalho já foi conferido; esta checagem só pega um arquivo que
+  // mudou de layout entre a validação e a carga.
+  const faltando = COLUNAS_OBRIGATORIAS.filter((c) => !carga.cabecalho.includes(c));
+  if (faltando.length > 0) {
+    throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
+  }
 
-      // O COMMIT roda logo depois deste retorno, em emTransacao.
-      await acompanhamento.fase(
-        'COMMIT',
-        `${numeroBR(carga.inseridas)} inseridas · ${numeroBR(carga.atualizadas)} atualizadas`,
-      );
-      return carga;
-    });
-  }, { longa: true });
+  const gravadas = carga.inseridas + carga.atualizadas;
+  await emTransacao(async (cliente) => {
+    await cliente.query(
+      `UPDATE infoprice.ctl_execucao_arquivo
+          SET linhas_lidas = $3,
+              linhas_gravadas = $4,
+              linhas_rejeitadas = 0,
+              linhas_inseridas = $5,
+              linhas_atualizadas = $6,
+              destino = 'copy → fact',
+              status = 'ingerido',
+              erro = NULL,
+              ingerido_em = now()
+        WHERE id_execucao = $1 AND id_arquivo = $2`,
+      [registro.id, arquivo.idArquivo, carga.linhas, gravadas, carga.inseridas, carga.atualizadas],
+    );
+    // O inventário guarda só a situação atual do arquivo na origem.
+    await cliente.query(
+      `UPDATE infoprice.ctl_arquivo
+          SET status = 'ingerido', erro = NULL, ingerido_em = now(), atualizado_em = now()
+        WHERE id = $1`,
+      [arquivo.idArquivo],
+    );
+  });
+  return carga;
 }
 
 /**

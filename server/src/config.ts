@@ -179,11 +179,17 @@ export const config = {
      */
     hashDescompactado: booleano('HASH_DESCOMPACTADO', false),
     /**
-     * Quantos arquivos são gravados no banco ao mesmo tempo, cada um na sua
-     * transação. A gravação de um arquivo ocupa um núcleo do PostgreSQL: use
-     * até o número de vCPUs da instância (no RDS, a classe diz quantas).
+     * Em quantas conexões cada arquivo é gravado ao mesmo tempo. Um INSERT
+     * usa um núcleo do PostgreSQL só: as partes somam os demais. Use o número
+     * de vCPUs da instância (no RDS, a classe diz quantas).
      */
-    paralelismoGravacao: numero('GRAVACAO_PARALELISMO', 2),
+    partesPorArquivo: numero('GRAVACAO_PARTES', 4),
+    /**
+     * Quantos arquivos são gravados ao mesmo tempo. Com as partes já ocupando
+     * os núcleos, 1 deixa cada arquivo mais rápido; mais que 1 só compensa com
+     * núcleos sobrando. Arquivos × partes precisa caber em PGPOOL_MAX.
+     */
+    paralelismoGravacao: numero('GRAVACAO_PARALELISMO', 1),
     /**
      * Nomes de coluna do arquivo que diferem dos usados aqui, no formato
      * "coluna_interna=nome_no_arquivo" separados por vírgula

@@ -134,8 +134,10 @@ export interface ProgressoGravacao {
   faseDesde: string;
   arquivoDesde: string;
   linhasLidas: number;
-  /** Backend da transação do arquivo; nulo entre um arquivo e outro. */
+  /** Um dos backends gravando o arquivo; nulo entre um arquivo e outro. */
   pid: number | null;
+  /** Todos os backends gravando o arquivo (um por parte). Ausente em execuções antigas. */
+  pids?: number[];
   atualizadoEm: string;
   banco: SessaoBanco | null;
   /** Quem segura o lock que a transação espera (pg_blocking_pids). */
