@@ -9,18 +9,12 @@ import { consultarUm, emTransacao, pool } from '../db/pool.js';
 import { comOrigem, type ArquivoRemoto, type DriverOrigem } from '../sftp/index.js';
 import { bytesBR, duracaoBR, numeroBR, percentualBR } from '../util/formato.js';
 import { somarDias } from '../util/tempo.js';
-import { carregarArquivoEmStaging, limparStagingArquivo } from './carga-staging.js';
+import { carregarArquivoRapido, type ResultadoCargaRapida } from './carga-rapida.js';
 import {
   COLUNAS_OBRIGATORIAS,
   lerCabecalho,
   validarCabecalho,
 } from './leitor-csv.js';
-import { mergeIncremental } from './merge-incremental.js';
-import {
-  aplicarRegrasQualidade,
-  cadastrarLojasNovas,
-  type ContagemMotivo,
-} from './regras-qualidade.js';
 import { RegistroExecucao } from './registro-execucao.js';
 import { AcompanhamentoArquivo } from './acompanhamento.js';
 import {
@@ -83,7 +77,13 @@ async function hashDescompactado(caminho: string): Promise<string | null> {
   return hash.digest('hex');
 }
 
-/** Roda `tarefas` com no máximo `limite` em paralelo, preservando a ordem. */
+/**
+ * Roda `tarefas` com no máximo `limite` em paralelo, preservando a ordem.
+ *
+ * Depois do primeiro erro nenhum item novo começa, e o erro só sobe quando
+ * os que já estavam em curso terminarem: numa parada, cada transação aberta
+ * é revertida antes de a execução ser fechada como cancelada.
+ */
 async function emParalelo<T, R>(
   itens: T[],
   limite: number,
@@ -91,18 +91,26 @@ async function emParalelo<T, R>(
 ): Promise<R[]> {
   const resultados = new Array<R>(itens.length);
   let proximo = 0;
+  let falhou = false;
 
   const trabalhador = async () => {
-    for (;;) {
+    while (!falhou) {
       const i = proximo++;
       if (i >= itens.length) return;
-      resultados[i] = await fn(itens[i]!, i);
+      try {
+        resultados[i] = await fn(itens[i]!, i);
+      } catch (erro) {
+        falhou = true;
+        throw erro;
+      }
     }
   };
 
-  await Promise.all(
-    Array.from({ length: Math.min(limite, itens.length) }, trabalhador),
+  const fim = await Promise.allSettled(
+    Array.from({ length: Math.max(1, Math.min(limite, itens.length)) }, trabalhador),
   );
+  const erro = fim.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (erro) throw erro.reason;
   return resultados;
 }
 
@@ -345,17 +353,22 @@ async function rodarEtapas(
   // ── 4 · Verificação de integridade ────────────────────────────────────────
   await verificar();
   await registro.etapa('Verificação de integridade', async () => {
-    for (const arquivo of baixados) {
+    // Em paralelo, como o download. O hash do conteúdo descompactado é
+    // opcional (HASH_DESCOMPACTADO): ele obriga a descompactar a pasta
+    // inteira só para conferir.
+    await emParalelo(baixados, config.coleta.paralelismo, async (arquivo) => {
       await verificar();
       arquivo.sha256 = await hashArquivo(arquivo.caminhoLocal);
-      const descompactado = await hashDescompactado(arquivo.caminhoLocal);
+      const descompactado = config.coleta.hashDescompactado
+        ? await hashDescompactado(arquivo.caminhoLocal)
+        : null;
       await pool.query(
         `UPDATE infoprice.ctl_arquivo
             SET sha256 = $2, sha256_descompactado = $3, atualizado_em = now()
           WHERE id = $1`,
         [arquivo.idArquivo, arquivo.sha256, descompactado],
       );
-    }
+    });
     await registro.info(
       `sha-256 conferido em ${baixados.length} arquivos · nenhum divergente`,
     );
@@ -431,27 +444,47 @@ async function rodarEtapas(
     };
   });
 
-  // ── 6 a 8 · um arquivo por vez, do staging à gravação ─────────────────────
-  // Cada arquivo passa por staging, regras de qualidade e merge numa transação
-  // própria e é efetivado antes do próximo começar. O que já foi gravado fica
+  // ── 6 a 8 · um arquivo por vez, direto na tabela final ────────────────────
+  // Cada arquivo é lido pelo COPY nativo e gravado no fato numa transação
+  // própria, efetivada antes do próximo começar. O que já foi gravado fica
   // gravado: uma falha no arquivo 30 não desfaz os 29 anteriores — reverte só
-  // o arquivo 30, que a varredura tenta de novo.
+  // o arquivo 30, que a varredura tenta de novo. Sem regras de qualidade: a
+  // linha entra como veio, desde que tenha o que a tabela exige.
   await registro.iniciarEtapa('Carga em staging');
-  await registro.iniciarEtapa('Regras de qualidade');
+  await registro.ignorarEtapa('Regras de qualidade', 'desligadas · carga direta');
   await registro.iniciarEtapa('Merge incremental');
 
   const totais = {
     arquivosIngeridos: 0,
-    linhasStaging: 0,
-    rejeitadas: 0,
+    linhas: 0,
+    naoGravadas: 0,
     inseridas: 0,
     atualizadas: 0,
     comErro: 0,
-    lojasNovas: 0,
   };
-  const porMotivo = new Map<string, number>();
 
-  for (const [i, arquivo] of aptos.entries()) {
+  // Vários arquivos ao mesmo tempo, cada um na sua transação e na sua conexão:
+  // a gravação de um arquivo usa um núcleo do banco, e o paralelismo soma os
+  // demais. Dois arquivos com a mesma chave podem se esperar ou travar um ao
+  // outro (deadlock); o que perder fica para o fim e é regravado sozinho.
+  const paralelo = Math.max(1, Math.trunc(config.coleta.paralelismoGravacao));
+  if (paralelo > 1) {
+    await registro.info(`gravação em paralelo · ${paralelo} arquivos por vez`);
+  }
+
+  // Criar partição trava a tabela final inteira até o fim da transação que a
+  // criou. Feito dentro da gravação de um arquivo, pararia os demais arquivos
+  // em paralelo: por isso as partições do período usual são criadas aqui,
+  // antes, cada uma na sua transação curta. Uma data fora dele ainda cria a
+  // partição na gravação do arquivo.
+  const criadas = await garantirParticoesDoPeriodo(runDate);
+  if (criadas > 0) await registro.info(`${criadas} partições mensais criadas em fact_preco_coletado`);
+
+  const gravarArquivo = async (
+    arquivo: ArquivoLocal,
+    i: number,
+    podeAdiar: boolean,
+  ): Promise<'ok' | 'adiado' | 'erro'> => {
     const t0 = Date.now();
     const posicao = `[${i + 1}/${aptos.length}]`;
     await verificar();
@@ -461,35 +494,30 @@ async function rodarEtapas(
       idArquivo: arquivo.idArquivo,
       nome: arquivo.nome,
     });
+    let resultado: 'ok' | 'adiado' | 'erro' = 'ok';
     try {
       await acompanhamento.iniciar();
-      const r = await processarArquivo(registro, arquivo, runDate, controle, acompanhamento);
+      const r = await processarArquivo(registro, arquivo, controle, acompanhamento);
       await acompanhamento.encerrar('efetivado');
 
       totais.arquivosIngeridos += 1;
-      totais.linhasStaging += r.linhas;
-      totais.rejeitadas += r.rejeitadas;
+      totais.linhas += r.linhas;
+      totais.naoGravadas += r.naoGravadas;
       totais.inseridas += r.inseridas;
       totais.atualizadas += r.atualizadas;
-      totais.lojasNovas += r.lojasNovas;
-      for (const c of r.contagens) {
-        porMotivo.set(c.motivo, (porMotivo.get(c.motivo) ?? 0) + c.quantidade);
-      }
 
+      const segundos = Math.max(0.001, (Date.now() - t0) / 1000);
       await registro.info(
         `${posicao} ${arquivo.nome} gravado em ${duracaoBR(Date.now() - t0)} · ` +
-          `${numeroBR(r.linhas)} lidas · ${numeroBR(r.rejeitadas)} rejeitadas · ` +
-          `${numeroBR(r.inseridas)} inseridas · ${numeroBR(r.atualizadas)} atualizadas · ` +
-          `tempos: ${acompanhamento.tempos()}`,
+          `${numeroBR(r.linhas)} lidas · ${numeroBR(r.inseridas)} inseridas · ` +
+          `${numeroBR(r.atualizadas)} atualizadas · ${numeroBR(r.naoGravadas)} não gravadas · ` +
+          `${numeroBR(Math.round(r.linhas / segundos))} linhas/s · tempos: ${acompanhamento.tempos()}`,
       );
-      if (r.recuperadas > 0) {
+      if (r.modo === 'tolerante') {
         await registro.warn(
-          `${arquivo.nome}: ${numeroBR(r.recuperadas)} linhas com aspas fora do padrão lidas em modo tolerante`,
-        );
-      }
-      if (r.malformadas > 0) {
-        await registro.warn(
-          `${arquivo.nome}: ${numeroBR(r.malformadas)} linhas malformadas seguem como rejeição`,
+          `${arquivo.nome}: lido pelo leitor tolerante (mais lento)` +
+            (r.recuperadas > 0 ? ` · ${numeroBR(r.recuperadas)} linhas com aspas fora do padrão` : '') +
+            (r.malformadas > 0 ? ` · ${numeroBR(r.malformadas)} linhas ilegíveis ficaram de fora` : ''),
         );
       }
     } catch (erro) {
@@ -502,23 +530,44 @@ async function rodarEtapas(
         throw erro;
       }
       const msg = erro instanceof Error ? erro.message : String(erro);
-      totais.comErro += 1;
-      await registro.erro(
-        `${posicao} ${arquivo.nome} revertido: ${explicarErroBanco(erro, msg)} · ` +
-          `tempos: ${tempos} · os demais arquivos seguem`,
-      );
-      await marcarArquivoComErro(registro.id, arquivo.idArquivo, msg);
+      const codigo = (erro as { code?: string } | null)?.code;
+      // Deadlock, lock esperado demais ou partição criada ao mesmo tempo por
+      // outro arquivo: conflitos da gravação em paralelo, que somem sozinho.
+      if (podeAdiar && ['40P01', '55P03', '42P07', '23505'].includes(codigo ?? '')) {
+        resultado = 'adiado';
+        await registro.warn(
+          `${posicao} ${arquivo.nome} revertido por conflito de lock com outra gravação (${msg}) · ` +
+            'regravado sozinho no fim',
+        );
+      } else {
+        resultado = 'erro';
+        totais.comErro += 1;
+        await registro.erro(
+          `${posicao} ${arquivo.nome} revertido: ${explicarErroBanco(erro, msg)} · ` +
+            `tempos: ${tempos} · os demais arquivos seguem`,
+        );
+        await marcarArquivoComErro(registro.id, arquivo.idArquivo, msg);
+      }
     }
 
     // O painel acompanha o avanço arquivo a arquivo.
     await registro.atualizar({
       arquivos_ingeridos: totais.arquivosIngeridos,
-      linhas_staging: totais.linhasStaging,
+      linhas_staging: totais.linhas,
       linhas_gravadas: totais.inseridas + totais.atualizadas,
       linhas_inseridas: totais.inseridas,
       linhas_atualizadas: totais.atualizadas,
-      linhas_rejeitadas: totais.rejeitadas,
+      linhas_rejeitadas: 0,
     });
+    return resultado;
+  };
+
+  const adiados: [ArquivoLocal, number][] = [];
+  await emParalelo(aptos, paralelo, async (arquivo, i) => {
+    if ((await gravarArquivo(arquivo, i, paralelo > 1)) === 'adiado') adiados.push([arquivo, i]);
+  });
+  for (const [arquivo, i] of adiados) {
+    await gravarArquivo(arquivo, i, false);
   }
 
   const gravadas = totais.inseridas + totais.atualizadas;
@@ -528,32 +577,20 @@ async function rodarEtapas(
   if (totais.arquivosIngeridos === 0) {
     const detalhe = `nenhum dos ${aptos.length} arquivos pôde ser gravado`;
     await registro.falharEtapa('Carga em staging', detalhe);
-    await registro.falharEtapa('Regras de qualidade', detalhe);
     await registro.falharEtapa('Merge incremental', detalhe);
     throw new Error(detalhe);
   }
 
-  for (const [motivo, quantidade] of porMotivo) {
-    if (quantidade > 0) await registro.info(`  ${motivo}: ${numeroBR(quantidade)}`);
-  }
-  if (totais.rejeitadas > 0) {
-    await registro.warn(
-      `${numeroBR(totais.rejeitadas)} linhas reprovadas nas regras de qualidade · gravadas em ctl_rejeicao`,
-    );
-  }
-  if (totais.lojasNovas > 0) {
+  if (totais.naoGravadas > 0) {
     await registro.info(
-      `${numeroBR(totais.lojasNovas)} lojas novas cadastradas em dim_loja a partir dos arquivos`,
+      `${numeroBR(totais.naoGravadas)} linhas lidas e não gravadas: iguais às já gravadas, ` +
+        'repetidas no arquivo (vale a última) ou sem gtin, loja, data ou preço legível',
     );
   }
 
   await registro.concluirEtapa(
     'Carga em staging',
-    `COPY → stg_isa_infopanel_preco · ${numeroBR(totais.linhasStaging)}${sufixoErro}`,
-  );
-  await registro.concluirEtapa(
-    'Regras de qualidade',
-    `${numeroBR(totais.rejeitadas)} rejeições → ctl_rejeicao`,
+    `COPY nativo → tabela temporária · ${numeroBR(totais.linhas)} linhas${sufixoErro}`,
   );
   await registro.concluirEtapa(
     'Merge incremental',
@@ -608,73 +645,59 @@ async function rodarEtapas(
     totais.arquivosIngeridos < remotos.length ? 'parcial' : 'concluida';
   await registro.finalizar(status);
 
-  const percentual =
-    totais.linhasStaging > 0 ? (totais.rejeitadas / totais.linhasStaging) * 100 : 0;
-  if (percentual > 0) {
-    await registro.info(
-      `rejeições em ${percentualBR(percentual)} das linhas do run`,
-    );
-  }
-
   return {
     status,
     arquivosVistos: remotos.length,
     arquivosIngeridos: totais.arquivosIngeridos,
-    linhasStaging: totais.linhasStaging,
+    linhasStaging: totais.linhas,
     linhasGravadas: gravadas,
     linhasInseridas: totais.inseridas,
     linhasAtualizadas: totais.atualizadas,
-    linhasRejeitadas: totais.rejeitadas,
+    linhasRejeitadas: 0,
   };
 }
 
-interface ResultadoArquivo {
-  linhas: number;
-  rejeitadas: number;
-  inseridas: number;
-  atualizadas: number;
-  recuperadas: number;
-  malformadas: number;
-  lojasNovas: number;
-  contagens: ContagemMotivo[];
-}
-
 /**
- * Leva um arquivo do staging até a tabela final, numa transação só: limpa o
- * staging do arquivo, carrega, aplica as regras, faz o merge e atualiza a
- * trilha. Qualquer falha reverte apenas este arquivo.
+ * Leva um arquivo direto à tabela final, numa transação só: COPY nativo para
+ * uma tabela temporária, um UPSERT no fato e a trilha do arquivo. Qualquer
+ * falha reverte apenas este arquivo.
  */
 async function processarArquivo(
   registro: RegistroExecucao,
   arquivo: ArquivoLocal,
-  runDate: string,
   controle: ControleCancelamento,
   acompanhamento: AcompanhamentoArquivo,
-): Promise<ResultadoArquivo> {
-  // `longa`: COPY, regras e merge de um arquivo grande passam do teto de 30s
-  // aplicado às consultas de tela.
+): Promise<ResultadoCargaRapida> {
+  // `longa`: o UPSERT de um arquivo grande passa do teto de 30s aplicado às
+  // consultas de tela.
   return emTransacao(async (cliente) => {
     // Com o backend registrado, uma parada interrompe a consulta em curso no
-    // próprio PostgreSQL, em vez de esperar o merge terminar.
+    // próprio PostgreSQL, em vez de esperar a gravação terminar.
     const { rows } = await cliente.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
     const pid = rows[0]!.pid;
     return controle.comPid(pid, async () => {
       await acompanhamento.vincular(cliente, pid);
-      await acompanhamento.fase('limpando staging', `backend pid ${pid}`);
-      await limparStagingArquivo(cliente, arquivo.idArquivo);
+      await acompanhamento.fase('COPY → tabela temporária', `backend pid ${pid}`);
 
-      await acompanhamento.fase('COPY → staging');
-
-      const carga = await carregarArquivoEmStaging({
+      const carga = await carregarArquivoRapido({
         cliente,
         idExecucao: registro.id,
         idArquivo: arquivo.idArquivo,
-        arquivo: arquivo.nome,
         caminhoLocal: arquivo.caminhoLocal,
-        runDate,
         fonte: config.coleta.fonte,
         verificar: controle.verificar,
         aoProgresso: (linhas) => acompanhamento.linhas(linhas),
+        aoPasso: (passo, detalhe) =>
+          passo === 'partições'
+            ? acompanhamento.fase('partições')
+            : acompanhamento.fase('gravação → fact_preco_coletado', detalhe),
+        aoReler: async (motivo) => {
+          await registro.warn(
+            `${arquivo.nome}: o COPY nativo recusou o arquivo (${motivo.slice(0, 300)}) · ` +
+              'relendo com o leitor tolerante',
+          );
+          await acompanhamento.detalhe('leitor tolerante');
+        },
       });
 
       // O cabeçalho já foi conferido; esta checagem só pega um arquivo que
@@ -684,53 +707,20 @@ async function processarArquivo(
         throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
       }
 
-      await acompanhamento.fase('regras de qualidade', `${numeroBR(carga.linhas)} linhas em staging`);
-      let lojasNovas = 0;
-      if (config.coleta.cadastrarLojas) {
-        await acompanhamento.detalhe('cadastrando lojas novas em dim_loja');
-        lojasNovas = await cadastrarLojasNovas(cliente, registro.id, arquivo.idArquivo);
-      }
-
-      const contagens = await aplicarRegrasQualidade(
-        cliente,
-        registro.id,
-        arquivo.idArquivo,
-        (motivo, ordem, total) => acompanhamento.detalhe(`${ordem}/${total} ${motivo}`),
-      );
-      const rejeitadas = contagens.reduce((s, c) => s + c.quantidade, 0);
-
-      await acompanhamento.fase(
-        'merge → fact_preco_coletado',
-        `${numeroBR(carga.linhas - rejeitadas)} linhas aprovadas · ${numeroBR(rejeitadas)} rejeitadas`,
-      );
-      const merge = await mergeIncremental(
-        cliente,
-        registro.id,
-        arquivo.idArquivo,
-        (passo) => acompanhamento.detalhe(passo),
-      );
-
+      const gravadas = carga.inseridas + carga.atualizadas;
       await cliente.query(
         `UPDATE infoprice.ctl_execucao_arquivo
             SET linhas_lidas = $3,
                 linhas_gravadas = $4,
-                linhas_rejeitadas = $5,
-                linhas_inseridas = $6,
-                linhas_atualizadas = $7,
-                destino = 'stg → fact',
+                linhas_rejeitadas = 0,
+                linhas_inseridas = $5,
+                linhas_atualizadas = $6,
+                destino = 'copy → fact',
                 status = 'ingerido',
                 erro = NULL,
                 ingerido_em = now()
           WHERE id_execucao = $1 AND id_arquivo = $2`,
-        [
-          registro.id,
-          arquivo.idArquivo,
-          carga.linhas,
-          merge.gravadas,
-          rejeitadas,
-          merge.inseridas,
-          merge.atualizadas,
-        ],
+        [registro.id, arquivo.idArquivo, carga.linhas, gravadas, carga.inseridas, carga.atualizadas],
       );
 
       // O inventário guarda só a situação atual do arquivo na origem.
@@ -744,19 +734,9 @@ async function processarArquivo(
       // O COMMIT roda logo depois deste retorno, em emTransacao.
       await acompanhamento.fase(
         'COMMIT',
-        `${numeroBR(merge.inseridas)} inseridas · ${numeroBR(merge.atualizadas)} atualizadas`,
+        `${numeroBR(carga.inseridas)} inseridas · ${numeroBR(carga.atualizadas)} atualizadas`,
       );
-
-      return {
-        linhas: carga.linhas,
-        rejeitadas,
-        inseridas: merge.inseridas,
-        atualizadas: merge.atualizadas,
-        recuperadas: carga.recuperadas,
-        malformadas: carga.malformadas,
-        lojasNovas,
-        contagens,
-      };
+      return carga;
     });
   }, { longa: true });
 }
@@ -782,6 +762,42 @@ function explicarErroBanco(erro: unknown, msg: string): string {
   }
   if (codigo === '40P01') return `${msg} · deadlock com outra sessão`;
   return msg;
+}
+
+/** Meses de partição criados antes da gravação: os últimos dois anos e o próximo mês. */
+const MESES_ANTES = 24;
+
+/**
+ * Garante as partições mensais de MESES_ANTES antes do run até o mês seguinte
+ * a ele. Devolve quantas não existiam.
+ */
+async function garantirParticoesDoPeriodo(runDate: string): Promise<number> {
+  const { rows } = await pool.query<{ criadas: number }>(
+    `WITH meses AS (
+       SELECT generate_series(
+                date_trunc('month', $1::date) - make_interval(months => $2),
+                date_trunc('month', $1::date) + INTERVAL '1 month',
+                INTERVAL '1 month'
+              )::date AS mes
+     )
+     SELECT count(*)::int AS criadas
+       FROM meses
+      WHERE NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'infoprice'
+           AND c.relname = 'fact_preco_coletado_' || to_char(meses.mes, 'YYYY_MM')
+      )`,
+    [runDate, MESES_ANTES],
+  );
+  const criadas = rows[0]?.criadas ?? 0;
+  if (criadas === 0) return 0;
+  for (let i = MESES_ANTES; i >= -1; i -= 1) {
+    await pool.query(
+      `SELECT infoprice.garantir_particao((date_trunc('month', $1::date) - make_interval(months => $2))::date)`,
+      [runDate, i],
+    );
+  }
+  return criadas;
 }
 
 /** Marca o arquivo com erro nesta execução e no inventário, fora de transação. */

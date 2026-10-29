@@ -13,20 +13,27 @@ function desde(iso: string): string {
 }
 
 /**
- * Onde a gravação no banco está: o arquivo em curso, a fase dentro da
- * transação dele e o que o backend do PostgreSQL está fazendo agora. É o que
- * separa "o banco está trabalhando" de "o banco está parado esperando um lock".
+ * Onde a gravação no banco está: os arquivos em curso, a fase dentro da
+ * transação de cada um e o que o backend do PostgreSQL está fazendo agora. É
+ * o que separa "o banco está trabalhando" de "o banco está parado esperando
+ * um lock".
  */
 export function GravacaoNoBanco({
-  progresso: p,
+  progressos,
   aoVivo,
   emCurso,
 }: {
-  progresso: ProgressoGravacao;
+  progressos: ProgressoGravacao[];
   aoVivo: boolean;
   emCurso: boolean;
 }) {
-  const b = p.banco;
+  // Em curso: os arquivos em gravação agora (ou o último, entre um e outro).
+  // Depois do fim: os que foram revertidos, ou o último ponto registrado.
+  const ativos = progressos.filter((p) => p.pid !== null);
+  const revertidos = progressos.filter((p) => p.fase.startsWith('revertido'));
+  const visiveis = emCurso
+    ? ativos.length > 0 ? ativos : progressos.slice(0, 1)
+    : revertidos.length > 0 ? revertidos : progressos.slice(0, 1);
 
   return (
     <div className="cartao cartao__corpo" style={{ gap: 12 }}>
@@ -40,6 +47,7 @@ export function GravacaoNoBanco({
       >
         <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
           Gravação no banco
+          {emCurso && ativos.length > 1 ? ` · ${ativos.length} arquivos em paralelo` : ''}
         </h2>
         {aoVivo ? (
           <Pilula tom="exec">ao vivo · {hora(new Date().toISOString())}</Pilula>
@@ -50,6 +58,37 @@ export function GravacaoNoBanco({
         )}
       </div>
 
+      {visiveis.map((p, i) => (
+        <div
+          key={p.idArquivo}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 12,
+            ...(i > 0 ? { borderTop: '1px solid var(--borda)', paddingTop: 12 } : {}),
+          }}
+        >
+          <ItemGravacao p={p} emCurso={emCurso} compacto={visiveis.length > 1} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ItemGravacao({
+  p,
+  emCurso,
+  compacto,
+}: {
+  p: ProgressoGravacao;
+  emCurso: boolean;
+  /** Vários arquivos na tela: a consulta SQL só aparece quando há bloqueio. */
+  compacto: boolean;
+}) {
+  const b = p.banco;
+
+  return (
+    <>
       {p.bloqueadores.length > 0 && (
         <Aviso tag="Bloqueada" tom="erro">
           A transação do arquivo está parada há{' '}
@@ -98,7 +137,7 @@ export function GravacaoNoBanco({
       {emCurso && (
         <Par chave="Tempo no arquivo" valor={desde(p.arquivoDesde)} />
       )}
-      <Par chave="Linhas enviadas ao COPY" valor={numeroBR(p.linhasLidas)} />
+      <Par chave="Linhas lidas" valor={numeroBR(p.linhasLidas)} />
       {b ? (
         <>
           <Par
@@ -109,12 +148,14 @@ export function GravacaoNoBanco({
             chave="Consulta em curso há"
             valor={duracaoBR(b.consultaHaMs)}
           />
-          {b.consulta && <pre className="sql">{b.consulta}</pre>}
+          {b.consulta && (!compacto || p.bloqueadores.length > 0) && (
+            <pre className="sql">{b.consulta}</pre>
+          )}
         </>
       ) : (
         <Par chave="Backend" valor={p.pid ? `pid ${p.pid}` : '—'} />
       )}
       <Par chave="Atualizado às" valor={hora(p.atualizadoEm)} />
-    </div>
+    </>
   );
 }

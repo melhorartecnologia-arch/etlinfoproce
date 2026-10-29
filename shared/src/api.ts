@@ -75,10 +75,11 @@ export interface DetalheExecucaoResposta {
   totalEventos: number;
   arquivos: Arquivo[];
   /**
-   * A gravação no banco: ao vivo enquanto a execução roda; depois dela, o
-   * último ponto registrado — onde uma execução interrompida parou.
+   * A gravação no banco, um item por arquivo: os em gravação primeiro, ao vivo
+   * enquanto a execução roda; depois dela, o último ponto registrado de cada
+   * arquivo — onde uma execução interrompida parou.
    */
-  progresso: ProgressoGravacao | null;
+  progresso: ProgressoGravacao[];
   /** O retrato do banco em `progresso` foi tirado agora, nesta resposta. */
   progressoAoVivo: boolean;
 }

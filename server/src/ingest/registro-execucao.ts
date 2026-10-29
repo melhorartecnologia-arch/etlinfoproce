@@ -149,6 +149,16 @@ export class RegistroExecucao {
   }
 
   /** Fecha as etapas que ficaram abertas: a em curso como erro, as demais ignoradas. */
+  /** Marca uma etapa que não roda nesta configuração. */
+  async ignorarEtapa(nome: NomeEtapa, detalhe: string): Promise<void> {
+    await pool.query(
+      `UPDATE infoprice.ctl_execucao_etapa
+          SET status = 'ignorada', detalhe = $3, finalizado_em = now(), duracao_ms = 0
+        WHERE id_execucao = $1 AND ordem = $2`,
+      [this.id, this.ordemDe(nome), detalhe],
+    );
+  }
+
   /** Troca o detalhe de uma etapa em curso, para o painel mostrar o avanço. */
   async detalharEtapa(nome: NomeEtapa, detalhe: string): Promise<void> {
     await pool.query(

@@ -6,7 +6,7 @@ import type { RegistroExecucao } from './registro-execucao.js';
 /**
  * Visibilidade da gravação no banco.
  *
- * A transação de um arquivo (limpeza do staging, COPY, regras, merge, COMMIT)
+ * A transação de um arquivo (COPY, partições, gravação no fato, COMMIT)
  * pode levar minutos, e até aqui o log só ganhava uma linha quando ela
  * terminava. Este módulo diz, enquanto ela roda, em que fase está, quantas
  * linhas já foram enviadas e o que o backend do PostgreSQL está fazendo — e,
@@ -102,17 +102,14 @@ export function descreverBloqueador(b: SessaoBanco): string {
 
 /** As fases da transação de um arquivo, na ordem em que rodam. */
 export type Fase =
-  | 'limpando staging'
-  | 'COPY → staging'
-  | 'regras de qualidade'
-  | 'merge → fact_preco_coletado'
+  | 'COPY → tabela temporária'
+  | 'partições'
+  | 'gravação → fact_preco_coletado'
   | 'COMMIT';
 
 /** Em que etapa do painel cada fase da gravação se encaixa. */
 function etapaDaFase(fase: Fase): NomeEtapa {
-  if (fase === 'regras de qualidade') return 'Regras de qualidade';
-  if (fase === 'merge → fact_preco_coletado' || fase === 'COMMIT') return 'Merge incremental';
-  return 'Carga em staging';
+  return fase === 'COPY → tabela temporária' ? 'Carga em staging' : 'Merge incremental';
 }
 
 /**
@@ -233,7 +230,7 @@ export class AcompanhamentoArquivo {
     }
   }
 
-  /** "limpando staging 0s · COPY → staging 42s · …" — onde o tempo do arquivo foi. */
+  /** "COPY 2s · partições 0s · gravação 14s · COMMIT 0s" — onde o tempo do arquivo foi. */
   tempos(): string {
     if (this.faseAtual) this.duracoes.set(this.faseAtual, Date.now() - this.inicioFase);
     return [...this.duracoes]
@@ -298,7 +295,7 @@ export class AcompanhamentoArquivo {
           ocioso ? 'WARN' : 'INFO',
           `${this.prefixo} · ${this.faseAtual ?? 'gravação'} há ${duracaoBR(naFase)} · ` +
             `backend pid ${s.pid} ${descreverEspera(s)}` +
-            (this.faseAtual === 'COPY → staging'
+            (this.faseAtual === 'COPY → tabela temporária'
               ? ` · ${numeroBR(this.progresso.linhasLidas)} linhas enviadas`
               : '') +
             (ocioso
@@ -319,11 +316,21 @@ export class AcompanhamentoArquivo {
   private persistir(): Promise<void> {
     const proxima = this.fila.then(async () => {
       this.progresso.atualizadoEm = new Date().toISOString();
+      // Um objeto por arquivo, chaveado pelo id: com a gravação em paralelo,
+      // cada arquivo atualiza só a própria entrada, e o merge no banco é
+      // atômico — um não apaga o progresso do outro. (O formato antigo, um
+      // objeto só com `posicao`, é substituído na primeira gravação.)
       await pool
-        .query('UPDATE infoprice.ctl_execucao SET progresso = $2 WHERE id = $1', [
-          this.registro.id,
-          JSON.stringify(this.progresso),
-        ])
+        .query(
+          `UPDATE infoprice.ctl_execucao
+              SET progresso = CASE
+                    WHEN jsonb_typeof(progresso) = 'object' AND NOT progresso ? 'posicao'
+                      THEN progresso
+                    ELSE '{}'::jsonb
+                  END || jsonb_build_object($2::text, $3::jsonb)
+            WHERE id = $1`,
+          [this.registro.id, String(this.progresso.idArquivo), JSON.stringify(this.progresso)],
+        )
         .catch((erro: unknown) => {
           console.warn(
             `[exec ${this.registro.id}] progresso:`,

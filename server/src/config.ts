@@ -159,17 +159,31 @@ export const config = {
     retencaoLocalDias: numero('RETENCAO_LOCAL_DIAS', 30),
     colunasEsperadas: numero('COLUNAS_ESPERADAS', 44),
     /**
-     * Quantos dias antes do run a data do preço ainda é aceita. O arquivo da
-     * InfoPrice traz o último preço visto de cada produto em cada loja, e essa
-     * data pode ser de meses atrás. Data posterior ao run é sempre rejeitada.
+     * Janela de data e cadastro de lojas eram regras de qualidade; a carga
+     * direta não as aplica mais. Ficam para explicar, na tela de rejeições,
+     * as linhas rejeitadas por execuções anteriores.
      */
     janelaColetaDias: numero('JANELA_COLETA_DIAS', 365),
-    /**
-     * Cadastra em dim_loja as lojas que aparecem no arquivo. O arquivo traz
-     * rede, UF e cidade de cada loja; sem isto, a regra "Loja ausente em
-     * dim_loja" rejeitaria toda loja ainda não cadastrada à mão.
-     */
     cadastrarLojas: booleano('CADASTRAR_LOJAS', true),
+    /**
+     * work_mem da transação de carga: a deduplicação (quando o arquivo repete
+     * uma chave) e as partições cabem em memória em vez de irem para o disco.
+     */
+    memoriaCarga: /^\d+\s*(kB|MB|GB)$/i.test(texto('PG_MEMORIA_CARGA', ''))
+      ? texto('PG_MEMORIA_CARGA', '')
+      : '256MB',
+    /**
+     * SHA-256 também do conteúdo descompactado. Exige descompactar cada
+     * arquivo só para o hash — na prática, ler a pasta inteira mais uma vez.
+     * O hash do arquivo como chegou é sempre calculado.
+     */
+    hashDescompactado: booleano('HASH_DESCOMPACTADO', false),
+    /**
+     * Quantos arquivos são gravados no banco ao mesmo tempo, cada um na sua
+     * transação. A gravação de um arquivo ocupa um núcleo do PostgreSQL: use
+     * até o número de vCPUs da instância (no RDS, a classe diz quantas).
+     */
+    paralelismoGravacao: numero('GRAVACAO_PARALELISMO', 2),
     /**
      * Nomes de coluna do arquivo que diferem dos usados aqui, no formato
      * "coluna_interna=nome_no_arquivo" separados por vírgula

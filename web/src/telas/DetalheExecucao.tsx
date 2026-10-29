@@ -179,9 +179,9 @@ export function DetalheExecucao({
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {d.progresso && e.status !== 'concluida' && (
+          {d.progresso.length > 0 && e.status !== 'concluida' && (
             <GravacaoNoBanco
-              progresso={d.progresso}
+              progressos={d.progresso}
               aoVivo={d.progressoAoVivo}
               emCurso={e.status === 'em_execucao'}
             />
@@ -222,7 +222,7 @@ export function DetalheExecucao({
 
       <Painel
         titulo="Arquivos da execução"
-        nota="hash conferido na origem e após descompactação"
+        nota="sha-256 conferido em cada arquivo antes da carga"
       >
         {d.arquivos.length === 0 ? (
           <Vazio>Nenhum arquivo associado a esta execução.</Vazio>
@@ -264,8 +264,7 @@ export function DetalheExecucao({
                   <td className="mono suave">{a.destino ?? '—'}</td>
                   <td>
                     {e.status === 'em_execucao' &&
-                    d.progresso?.pid &&
-                    d.progresso.idArquivo === a.id ? (
+                    d.progresso.some((p) => p.pid !== null && p.idArquivo === a.id) ? (
                       <Pilula tom="exec">gravando</Pilula>
                     ) : (
                       <Pilula tom={a.status === 'ingerido' ? 'ok' : a.status === 'erro' ? 'erro' : 'neutro'}>

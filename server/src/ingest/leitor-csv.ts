@@ -54,7 +54,7 @@ const SINONIMOS: Record<string, string> = {
 };
 
 /** Como o Spark (e o Hive) grava nulo em CSV. */
-const NULO = '\\N';
+export const NULO = '\\N';
 
 const VERDADEIRO = /^(true|1|s|sim|y|yes)$/i;
 
@@ -299,6 +299,8 @@ export interface LinhaLida {
    * espelham o arquivo — ver colunas-origem.ts.
    */
   brutos: Record<string, string>;
+  /** Os valores na ordem das colunas do arquivo, como vieram, com o nulo \N do Spark. */
+  valores: string[];
   payload: string;
   /**
    * Preenchido quando a linha não pôde ser separada em colunas. Ela segue para
@@ -504,7 +506,7 @@ export async function lerCsv(
     // O payload guarda a linha exatamente como veio — com o delimitador e as
     // aspas originais —, para a tela de rejeições mostrar o original e
     // reinterpretá-lo coluna a coluna.
-    lote.push({ numeroLinha, campos, brutos, payload, ...(erro ? { erro } : {}) });
+    lote.push({ numeroLinha, campos, brutos, valores, payload, ...(erro ? { erro } : {}) });
     if (lote.length >= tamanhoLote) {
       await aoLote(lote);
       lote = [];

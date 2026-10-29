@@ -78,6 +78,9 @@ anterior — e tem um seletor para rever o painel de qualquer data já processad
 
 ## Entender as rejeições
 
+> A carga direta (padrão) não aplica regras de qualidade e não grava
+> rejeições: esta tela mostra as rejeições das execuções anteriores a ela.
+
 **Qualidade e rejeições** examina qualquer execução (seletor no topo; abre na
 mais recente). Os motivos filtram a lista ao clique; dá para filtrar também por
 arquivo e procurar um trecho na linha (GTIN, loja, descrição). Cada linha
@@ -170,35 +173,78 @@ A coleta roda em dez etapas, as mesmas que aparecem no painel:
 | 1 | Conexão SFTP | autentica por chave `.pem` (senha só como alternativa) |
 | 2 | Listagem do diretório | acha a pasta `run=AAAA-MM-DD` e compara o volume com a média de 7 dias |
 | 3 | Download para área temporária | baixa em paralelo para `var/spool/infoprice` |
-| 4 | Verificação de integridade | SHA-256 do arquivo e do conteúdo descompactado |
+| 4 | Verificação de integridade | SHA-256 do arquivo, em paralelo (do conteúdo descompactado só com `HASH_DESCOMPACTADO=true`) |
 | 5 | Validação de schema | confere só o cabeçalho de cada arquivo, antes de carregar |
-| 6 | Carga em staging | `COPY` em `stg_isa_infopanel_preco`, tudo como texto |
-| 7 | Regras de qualidade | oito regras; a linha reprovada vai para `ctl_rejeicao` com o payload original |
-| 8 | Merge incremental | `UPSERT` em `fact_preco_coletado` pela chave de conflito |
+| 6 | Carga em staging | `COPY` nativo do PostgreSQL para uma tabela temporária por arquivo |
+| 7 | Regras de qualidade | desligadas: aparece como ignorada |
+| 8 | Merge incremental | um `UPSERT` por arquivo em `fact_preco_coletado`, vários arquivos em paralelo |
 | 9 | Auditoria e watermark | fecha `ctl_execucao` e avança `ctl_watermark` |
 | 10 | Notificação | resumo no painel e por e-mail |
 
-As etapas 6 a 8 rodam **arquivo a arquivo, cada um numa transação própria**:
-o arquivo passa por staging, regras e merge e é efetivado antes de o próximo
-começar. O que já foi gravado fica gravado — uma falha no arquivo 30 reverte
-só o arquivo 30, os demais seguem, a execução fecha como parcial e a varredura
-tenta o arquivo de novo. O painel mostra o avanço a cada arquivo, e o log
-registra uma linha por arquivo gravado (lidas, rejeitadas, inseridas,
-atualizadas, duração). O log é gravado fora das transações e sobrevive para
+As etapas 6 a 8 rodam **cada arquivo numa transação própria**, até
+`GRAVACAO_PARALELISMO` arquivos ao mesmo tempo (2 por padrão). O que já foi
+gravado fica gravado — uma falha no arquivo 30 reverte só o arquivo 30, os
+demais seguem, a execução fecha como parcial e a varredura tenta o arquivo de
+novo. O painel mostra o avanço a cada arquivo, e o log registra uma linha por
+arquivo gravado (lidas, inseridas, atualizadas, não gravadas, linhas/s e o
+tempo de cada fase). O log é gravado fora das transações e sobrevive para
 explicar qualquer falha.
+
+### Carga direta
+
+O arquivo vai do disco para a tabela final sem passar por regras de qualidade:
+
+1. o próprio PostgreSQL lê o CSV (`COPY` nativo, `|`, nulo `\N`, escape `\"`
+   do Spark) para uma tabela temporária com uma coluna por coluna do arquivo.
+   Tabela temporária não tem índice nem WAL — é a escrita mais barata que o
+   banco oferece;
+2. um único `INSERT … SELECT … ON CONFLICT` converte e grava o arquivo inteiro
+   no fato. Número e data no formato comum convertem direto na consulta; só o
+   que foge dele (vírgula decimal, `dd/mm/aaaa`) passa pelas funções
+   `infoprice.para_numero` e `para_data`.
+
+Nada é validado além do que a tabela exige para aceitar a linha: GTIN, loja e
+data legíveis e um preço que caiba em `numeric(12,2)`. A linha sem isso não tem
+como ser gravada e só entra na conta de "não gravadas" — que soma também as
+linhas iguais às já gravadas e as repetidas no arquivo (vale a última).
+
+Se o `COPY` nativo recusar um arquivo (aspas fora do padrão, byte inválido), ele
+é relido pelo leitor tolerante em Node — mais lento, mesmo resultado —, e o log
+diz qual arquivo passou por isso.
+
+As partições mensais dos últimos 24 meses e do mês seguinte são criadas antes
+da gravação, cada uma na sua transação curta: criar partição trava a tabela
+final, e dentro da gravação de um arquivo pararia os demais. Dois arquivos em
+paralelo com a mesma chave se esperam; se chegarem a travar um ao outro
+(deadlock), o que perder é regravado sozinho no fim.
+
+| Variável | Padrão | |
+|---|---|---|
+| `GRAVACAO_PARALELISMO` | 2 | arquivos gravados ao mesmo tempo; até o número de vCPUs do banco |
+| `PG_MEMORIA_CARGA` | 256MB | `work_mem` da transação de carga |
+| `HASH_DESCOMPACTADO` | false | SHA-256 também do conteúdo descompactado (lê a pasta mais uma vez) |
+
+Medido com arquivos de 400 mil linhas e 44 colunas, numa máquina de 4 núcleos:
+
+| | por arquivo | 4 arquivos |
+|---|---|---|
+| staging + 8 regras + merge (antes) | 62 s | ~250 s |
+| carga direta, um por vez | 20 s | 85 s |
+| carga direta, 4 em paralelo | — | 43 s |
 
 A etapa 5 confere o cabeçalho de todos os arquivos antes de carregar qualquer
 linha, então um layout errado é recusado em segundos, com a primeira linha do
 arquivo no log para diagnóstico.
 
-**Idempotência.** Reexecutar o mesmo run é seguro: o staging de cada arquivo é
-apagado e recarregado, e o `UPSERT` só conta como atualização a linha cujo preço
-mudou de fato. Reprocessar um dia sem alteração na origem grava zero linhas.
+**Idempotência.** Reexecutar o mesmo run é seguro: o `UPSERT` só reescreve a
+linha em que alguma coluna mudou de fato. Reprocessar um dia sem alteração na
+origem grava zero linhas.
 
-### As oito regras de qualidade
+### As oito regras de qualidade (execuções anteriores à carga direta)
 
-Rodam em ordem sobre o staging de cada arquivo; a primeira que pega a linha é a
-dona da rejeição, então uma linha nunca aparece com dois motivos.
+Rodavam em ordem sobre o staging de cada arquivo; a primeira que pegava a linha
+era a dona da rejeição. A carga direta não as aplica; a lista fica para ler as
+rejeições já gravadas.
 
 1. Linha malformada no arquivo (não pôde ser separada em colunas)
 2. GTIN inválido no dígito verificador (módulo 10 GS1, em `infoprice.gtin_valido`)
@@ -217,12 +263,13 @@ dona da rejeição, então uma linha nunca aparece com dois motivos.
 
 ### Leitura tolerante do CSV
 
-Uma linha defeituosa nunca interrompe a execução. O leitor aceita os dois
+Usada quando o `COPY` nativo recusa o arquivo. Uma linha defeituosa nunca
+interrompe a execução. O leitor aceita os dois
 escapes de aspas que aparecem na prática — `""` e `\"`, o padrão do Spark, que
 gera os arquivos `part-*.csv.gz` — e campos entre aspas com quebra de linha.
 Uma aspa solta é lida como texto quando a linha ainda tem o número certo de
-colunas; quando não tem, a linha entra no staging com o texto original e cai
-na regra 1. O log da execução conta as linhas de cada caso, por arquivo.
+colunas; quando não tem, a linha fica de fora. O log da execução conta as
+linhas de cada caso, por arquivo.
 
 ### Layout do arquivo
 
@@ -388,7 +435,7 @@ conexões ociosas são tratados e registrados: o driver descarta a conexão
 quebrada e abre outra sozinho.
 
 `statement_timeout` vale 30 s para as consultas de tela. A transação da
-ingestão — COPY, regras de qualidade e merge — levanta o próprio teto para
+ingestão — COPY e gravação de cada arquivo — levanta o próprio teto para
 `PG_TIMEOUT_INGESTAO_MS` (1 h por padrão), porque ela passa bem disso com
 volume real. `idle_in_transaction_session_timeout` derruba a sessão que ficar
 parada dentro de uma transação, para que um processo travado não segure locks
@@ -403,21 +450,21 @@ até o fim segurando os locks do arquivo.
 
 ### Visibilidade da gravação no banco
 
-A transação de cada arquivo (limpeza do staging → COPY → regras → merge →
-COMMIT) é acompanhada enquanto roda:
+A transação de cada arquivo (COPY → partições → gravação → COMMIT) é
+acompanhada enquanto roda:
 
 - o log ganha uma linha a cada fase, com a duração da anterior, e o resumo do
-  arquivo diz onde o tempo foi (`tempos: limpando 0s · COPY 42s · regras 18s ·
-  merge 1m 10s · COMMIT 1s`); o COPY registra as linhas enviadas a cada minuto;
+  arquivo diz onde o tempo foi (`tempos: COPY 1s · partições 1s · gravação 16s ·
+  COMMIT 0s`); o COPY registra as linhas lidas a cada minuto;
 - a cada 15 s o backend da transação é observado em `pg_stat_activity`. Se ele
   estiver esperando um lock, o log recebe um WARN com o pid, a aplicação, a
   idade da transação e a última consulta de quem bloqueia, e o comando para
   liberar (`SELECT pg_terminate_backend(pid);`). Fase que passa de 2 min sem
   terminar também é registrada, dizendo se o banco segue trabalhando ou se
   está ocioso esperando a coleta;
-- o ponto atual fica em `ctl_execucao.progresso`, e a tela de detalhe da
-  execução mostra o cartão **Gravação no banco**, atualizado a cada 5 s, com o
-  retrato ao vivo do backend e de quem o bloqueia. Depois do fim, o cartão
+- o ponto atual de cada arquivo fica em `ctl_execucao.progresso`, e a tela de
+  detalhe da execução mostra o cartão **Gravação no banco**, atualizado a cada
+  5 s, com o retrato ao vivo de cada backend em gravação e de quem o bloqueia. Depois do fim, o cartão
   mostra o último ponto registrado — onde uma execução interrompida parou;
 - cada transação de arquivo aparece em `pg_stat_activity` como
   `ingestao exec#<execução> arq#<arquivo>`.

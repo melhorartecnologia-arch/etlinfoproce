@@ -70,13 +70,26 @@ export async function execucaoDoRun(runDate: string): Promise<Execucao | null> {
   );
 }
 
-/** O último progresso gravado da gravação no banco (ctl_execucao.progresso). */
-export async function progressoDaExecucao(id: number): Promise<ProgressoGravacao | null> {
-  const linha = await consultarUm<{ progresso: ProgressoGravacao | null }>(
-    'SELECT progresso FROM infoprice.ctl_execucao WHERE id = $1',
-    [id],
+/**
+ * O progresso gravado da gravação no banco (ctl_execucao.progresso), um item
+ * por arquivo: primeiro os que estão em gravação agora, depois os demais do
+ * mais recente para o mais antigo.
+ */
+export async function progressoDaExecucao(id: number): Promise<ProgressoGravacao[]> {
+  const linha = await consultarUm<{
+    progresso: ProgressoGravacao | Record<string, ProgressoGravacao> | null;
+  }>('SELECT progresso FROM infoprice.ctl_execucao WHERE id = $1', [id]);
+  const bruto = linha?.progresso;
+  if (!bruto) return [];
+  // Execuções gravadas antes da gravação em paralelo guardavam um objeto só.
+  const itens =
+    'posicao' in bruto
+      ? [bruto as ProgressoGravacao]
+      : Object.values(bruto as Record<string, ProgressoGravacao>);
+  return itens.sort((a, b) =>
+    (a.pid ? 0 : 1) - (b.pid ? 0 : 1) ||
+    (a.pid ? a.posicao - b.posicao : b.atualizadoEm.localeCompare(a.atualizadoEm)),
   );
-  return linha?.progresso ?? null;
 }
 
 export async function etapasDaExecucao(id: number): Promise<Etapa[]> {
@@ -318,10 +331,10 @@ export async function fluxoLinhagem(
       tom: 'neutro',
     },
     {
-      etapa: '2 · staging',
-      objeto: 'stg_isa_infopanel_preco',
+      etapa: '2 · leitura',
+      objeto: 'COPY nativo → tabela temporária',
       quantidade: execucao.linhasStaging,
-      nota: 'espelho do arquivo, apagado e recarregado por run',
+      nota: 'o PostgreSQL lê o arquivo direto, um por transação',
       tom: 'neutro',
     },
     {

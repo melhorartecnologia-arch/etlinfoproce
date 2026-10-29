@@ -41,7 +41,7 @@ import {
   todasRejeicoes,
   type FiltroRejeicoes,
 } from './rejeicoes.js';
-import { SQL_PERSISTENCIA } from '../ingest/merge-incremental.js';
+import { SQL_PERSISTENCIA } from '../ingest/carga-rapida.js';
 import { resolverIncidente } from '../alertas/index.js';
 import {
   exigirAutenticacao,
@@ -358,16 +358,19 @@ rotas.get(
       q.progressoDaExecucao(id),
     ]);
 
-    // Com a gravação em curso, o retrato do backend é tirado agora, e não o
-    // que o vigia gravou há até 15 s: é o que diz se o banco está trabalhando
-    // ou parado num lock no momento em que o operador olha.
+    // Com a gravação em curso, o retrato de cada backend é tirado agora, e
+    // não o que o vigia gravou há até 15 s: é o que diz se o banco está
+    // trabalhando ou parado num lock no momento em que o operador olha.
     let progressoAoVivo = false;
-    if (progresso?.pid && execucao.status === 'em_execucao') {
-      const retrato = await retratoBackend(progresso.pid).catch(() => null);
-      if (retrato) {
-        progresso.banco = retrato.sessao;
-        progresso.bloqueadores = retrato.bloqueadores;
-        progressoAoVivo = true;
+    if (execucao.status === 'em_execucao') {
+      for (const item of progresso) {
+        if (!item.pid) continue;
+        const retrato = await retratoBackend(item.pid).catch(() => null);
+        if (retrato) {
+          item.banco = retrato.sessao;
+          item.bloqueadores = retrato.bloqueadores;
+          progressoAoVivo = true;
+        }
       }
     }
 
@@ -397,7 +400,7 @@ rotas.get(
         {
           rotulo: 'destino',
           valor: `${config.banco.banco}.${config.banco.schema}`,
-          nota: 'staging + fato + tabelas de controle',
+          nota: 'fato + tabelas de controle · carga direta',
         },
         {
           rotulo: 'assinatura da execução',
@@ -411,7 +414,7 @@ rotas.get(
         { chave: 'Watermark após execução', valor: execucao.watermarkNovo ?? '—' },
         {
           chave: 'Reexecução do mesmo run',
-          valor: 'segura · substitui staging e reaplica upsert',
+          valor: 'segura · regrava pelo upsert, só o que mudou',
         },
         { chave: 'Transação', valor: 'uma por arquivo · falha reverte só o arquivo' },
         {
@@ -1088,7 +1091,7 @@ rotas.get(
               chave: 'Banco · schema',
               valor: `${config.banco.banco} · ${config.banco.schema}`,
             },
-            { chave: 'Staging', valor: 'stg_isa_infopanel_preco' },
+            { chave: 'Leitura', valor: 'COPY nativo → tabela temporária por arquivo' },
             {
               chave: 'Fato',
               valor: 'fact_preco_coletado (particionado por mês)',
@@ -1099,7 +1102,7 @@ rotas.get(
             },
             {
               chave: 'Estratégia',
-              valor: 'COPY em staging + UPSERT transacional',
+              valor: 'carga direta: COPY + UPSERT por arquivo, sem regras de qualidade',
             },
           ],
         },
@@ -1131,7 +1134,7 @@ rotas.get(
         },
         {
           nome: 'stg_isa_infopanel_preco',
-          descricao: 'Espelho do arquivo recebido, apagado e recarregado por run.',
+          descricao: 'Espelho do arquivo das execuções anteriores à carga direta; não é mais gravado.',
         },
         {
           nome: 'fact_preco_coletado',
