@@ -409,12 +409,12 @@ rotas.get(
         },
       ],
       idempotencia: [
-        { chave: 'Chave de conflito', valor: '(gtin, id_loja, data_coleta, fonte)' },
+        { chave: 'Chave', valor: 'nenhuma · inserção seca, sem verificação' },
         { chave: 'Watermark anterior', valor: execucao.watermarkAnterior ?? '—' },
         { chave: 'Watermark após execução', valor: execucao.watermarkNovo ?? '—' },
         {
           chave: 'Reexecução do mesmo run',
-          valor: 'segura · regrava pelo upsert, só o que mudou',
+          valor: 'segura · apaga o que o arquivo gravou antes e grava de novo',
         },
         { chave: 'Transação', valor: 'uma por arquivo · falha reverte só o arquivo' },
         {
@@ -602,8 +602,15 @@ rotas.get(
     const idExecucao = Number(req.query.execucao);
     const linha = await consultarUm<{ id: string }>(
       Number.isFinite(idExecucao) && idExecucao > 0
-        ? `SELECT id::text FROM infoprice.fact_preco_coletado
-            WHERE id_execucao = $1 ORDER BY atualizado_em DESC LIMIT 1`
+        ? // Pelo arquivo, que tem índice (ix_fato_arquivo); por execução não há.
+          `SELECT f.id::text FROM infoprice.ctl_execucao_arquivo ea
+             CROSS JOIN LATERAL (
+               SELECT id FROM infoprice.fact_preco_coletado
+                WHERE id_arquivo = ea.id_arquivo AND id_execucao = ea.id_execucao
+                LIMIT 1
+             ) f
+            WHERE ea.id_execucao = $1 AND ea.status = 'ingerido'
+            LIMIT 1`
         : `SELECT id::text FROM infoprice.fact_preco_coletado
             ORDER BY atualizado_em DESC LIMIT 1`,
       Number.isFinite(idExecucao) && idExecucao > 0 ? [idExecucao] : [],
@@ -1097,12 +1104,12 @@ rotas.get(
               valor: 'fact_preco_coletado (particionado por mês)',
             },
             {
-              chave: 'Chave de conflito',
-              valor: '(gtin, id_loja, data_coleta, fonte)',
+              chave: 'Chave',
+              valor: 'nenhuma · inserção seca, sem verificação',
             },
             {
               chave: 'Estratégia',
-              valor: 'carga direta: COPY + UPSERT por arquivo, sem regras de qualidade',
+              valor: 'inserção seca: COPY + INSERT por arquivo, sem chave nem verificação',
             },
           ],
         },

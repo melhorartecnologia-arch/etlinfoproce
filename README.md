@@ -177,7 +177,7 @@ A coleta roda em dez etapas, as mesmas que aparecem no painel:
 | 5 | Validação de schema | confere só o cabeçalho de cada arquivo, antes de carregar |
 | 6 | Carga em staging | `COPY` nativo do PostgreSQL para uma tabela temporária por arquivo |
 | 7 | Regras de qualidade | desligadas: aparece como ignorada |
-| 8 | Merge incremental | um `UPSERT` por arquivo em `fact_preco_coletado`, um arquivo por vez |
+| 8 | Merge incremental | um `INSERT` seco por arquivo em `fact_preco_coletado`, um arquivo por vez |
 | 9 | Auditoria e watermark | fecha `ctl_execucao` e avança `ctl_watermark` |
 | 10 | Notificação | resumo no painel e por e-mail |
 
@@ -186,43 +186,50 @@ arquivo é gravado inteiro ou não é gravado. O que já foi gravado fica
 gravado — uma falha no arquivo 30 reverte só o arquivo 30, os
 demais seguem, a execução fecha como parcial e a varredura tenta o arquivo de
 novo. O painel mostra o avanço a cada arquivo, e o log registra uma linha por
-arquivo gravado (lidas, inseridas, atualizadas, não gravadas, linhas/s e o
-tempo de cada fase). O log é gravado fora das transações e sobrevive para
+arquivo gravado (lidas, inseridas, linhas/s e o tempo de cada fase). O log é gravado fora das transações e sobrevive para
 explicar qualquer falha.
 
 ### Carga direta
 
-O arquivo vai do disco para a tabela final sem passar por regras de qualidade:
+O arquivo vai do disco para a tabela final sem nenhuma verificação:
 
 1. o próprio PostgreSQL lê o CSV (`COPY` nativo, `|`, nulo `\N`, escape `\"`
    do Spark) para uma tabela temporária com uma coluna por coluna do arquivo.
    Tabela temporária não tem índice nem WAL — é a escrita mais barata que o
    banco oferece;
-2. um único `INSERT … SELECT … ON CONFLICT` converte e grava o arquivo inteiro
+2. um único `INSERT … SELECT` converte e grava **todas** as linhas do arquivo
    no fato. Número e data no formato comum convertem direto na consulta; só o
    que foge dele (vírgula decimal, `dd/mm/aaaa`) passa pelas funções
-   `infoprice.para_numero` e `para_data`.
+   `infoprice.para_numero` e `para_data`; o que não converte fica vazio.
 
-Nada é validado além do que a tabela exige para aceitar a linha: GTIN, loja e
-data legíveis e um preço que caiba em `numeric(12,2)`. A linha sem isso não tem
-como ser gravada e só entra na conta de "não gravadas" — que soma também as
-linhas iguais às já gravadas e as repetidas no arquivo (vale a última).
+**A tabela final não tem chave** (migração 013): sem chave primária, sem
+`ON CONFLICT`, sem `NOT NULL` nos dados e com preço em `numeric` sem limite.
+Nenhuma linha é verificada nem descartada — sem GTIN, sem loja, com preço
+gigante, tudo entra como veio. A linha sem data legível, ou com data fora das
+partições mensais, vai para a partição `fact_preco_coletado_default`.
+
+Consequência: o mesmo preço trazido por arquivos de dias diferentes fica
+gravado uma vez por arquivo — o arquivo da InfoPrice traz o último preço visto
+de cada produto em cada loja, então a mesma (gtin, loja, data) aparece em vários
+dias. Quem consulta o fato e quer um preço por chave escolhe a linha (por
+exemplo, a do `id_execucao` mais recente).
 
 Se o `COPY` nativo recusar um arquivo (aspas fora do padrão, byte inválido), ele
 é relido pelo leitor tolerante em Node — mais lento, mesmo resultado —, e o log
 diz qual arquivo passou por isso.
 
-A gravação tenta primeiro o caminho mais curto: sem deduplicar e sem procurar
-os meses do arquivo. Se o arquivo repetir uma chave, ela refaz ficando com a
-última ocorrência; se trouxer data sem partição, cria a partição e refaz — e o
-log diz quando isso aconteceu. As partições mensais dos últimos 24 meses e do
-mês seguinte são criadas antes da gravação, cada uma na sua transação curta: criar partição trava a tabela
+As partições mensais dos últimos 24 meses e do mês seguinte são criadas antes
+da gravação, cada uma na sua transação curta: criar partição trava a tabela
 final, e dentro da gravação de um arquivo deixaria as telas de preço esperando
 o arquivo terminar.
 
+Ficam só os índices que as telas usam: `ix_fato_arquivo` (reprocessamento e
+linhagem) e `ix_fato_data_uf` (consulta de preços por data). Sem o segundo, a
+gravação ganha ~1,3 s por arquivo e a consulta de preços por data passa a varrer
+o mês inteiro: `DROP INDEX infoprice.ix_fato_data_uf;`.
+
 | Variável | Padrão | |
 |---|---|---|
-| `PG_MEMORIA_CARGA` | 256MB | `work_mem` da transação de carga |
 | `HASH_DESCOMPACTADO` | false | SHA-256 também do conteúdo descompactado (lê a pasta mais uma vez) |
 
 Medido com arquivos de 400 mil linhas e 44 colunas, numa máquina de 4 núcleos:
@@ -230,15 +237,18 @@ Medido com arquivos de 400 mil linhas e 44 colunas, numa máquina de 4 núcleos:
 | | por arquivo | 4 arquivos |
 |---|---|---|
 | staging + 8 regras + merge (antes) | 62 s | ~250 s |
-| carga direta, um arquivo por vez | 18–23 s | 85 s |
+| carga direta com chave e upsert | 18–23 s | 85 s |
+| inserção seca, sem chave (atual) | **8 s** | 34 s |
+| reprocessar o mesmo dia | 9–10 s | 39 s |
 
 A etapa 5 confere o cabeçalho de todos os arquivos antes de carregar qualquer
 linha, então um layout errado é recusado em segundos, com a primeira linha do
 arquivo no log para diagnóstico.
 
-**Idempotência.** Reexecutar o mesmo run é seguro: o `UPSERT` só reescreve a
-linha em que alguma coluna mudou de fato. Reprocessar um dia sem alteração na
-origem grava zero linhas.
+**Reprocessamento.** Reexecutar o mesmo run é seguro: antes de gravar, cada
+arquivo apaga as linhas que ele mesmo gravou numa carga anterior (pelo
+`id_arquivo`), na mesma transação. O arquivo nunca fica duplicado por ter sido
+reprocessado.
 
 ### As oito regras de qualidade (execuções anteriores à carga direta)
 
@@ -298,10 +308,7 @@ esquerda). `loja` e `id_loja` do arquivo também ficam como vieram (`loja`,
 valor que não converte (número ilegível) fica vazio, sem barrar a linha.
 
 Quando duas colunas do arquivo caem no mesmo nome interno, vale o primeiro
-valor não vazio. O merge atualiza uma linha do fato quando qualquer coluna
-muda — reprocessar uma data gravada antes desta versão preenche as colunas
-novas; reexecutar sem mudança grava zero. A exportação CSV de preços leva
-todas as colunas.
+valor não vazio. A exportação CSV de preços leva todas as colunas.
 
 As colunas obrigatórias são `gtin`, `descricao`, `id_loja`, `preco` e
 `data_coleta`; outros nomes alternativos comuns (`ean`, `produto`,
@@ -345,7 +352,7 @@ npm run dev                             # API em :3001, console em :5173
 
 Por padrão `SFTP_DRIVER=local`: a origem é um diretório do disco, com a mesma
 interface do SFTP real. O pipeline inteiro roda — download, hash, `COPY`,
-`UPSERT` —, só a leitura dos bytes muda.
+`INSERT` —, só a leitura dos bytes muda.
 
 ```bash
 npm run gerar-fixtures --workspace @infoprice/server -- --dias 6 --arquivos 4 --linhas 5000

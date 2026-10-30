@@ -457,9 +457,8 @@ async function rodarEtapas(
   const totais = {
     arquivosIngeridos: 0,
     linhas: 0,
-    naoGravadas: 0,
     inseridas: 0,
-    atualizadas: 0,
+    substituidas: 0,
     comErro: 0,
   };
 
@@ -490,15 +489,13 @@ async function rodarEtapas(
 
       totais.arquivosIngeridos += 1;
       totais.linhas += r.linhas;
-      totais.naoGravadas += r.naoGravadas;
       totais.inseridas += r.inseridas;
-      totais.atualizadas += r.atualizadas;
+      totais.substituidas += r.substituidas;
 
       const segundos = Math.max(0.001, (Date.now() - t0) / 1000);
       await registro.info(
         `${posicao} ${arquivo.nome} gravado em ${duracaoBR(Date.now() - t0)} · ` +
           `${numeroBR(r.linhas)} lidas · ${numeroBR(r.inseridas)} inseridas · ` +
-          `${numeroBR(r.atualizadas)} atualizadas · ${numeroBR(r.naoGravadas)} não gravadas · ` +
           `${numeroBR(Math.round(r.linhas / segundos))} linhas/s · tempos: ${acompanhamento.tempos()}`,
       );
       if (r.modo === 'tolerante') {
@@ -530,14 +527,14 @@ async function rodarEtapas(
     await registro.atualizar({
       arquivos_ingeridos: totais.arquivosIngeridos,
       linhas_staging: totais.linhas,
-      linhas_gravadas: totais.inseridas + totais.atualizadas,
+      linhas_gravadas: totais.inseridas,
       linhas_inseridas: totais.inseridas,
-      linhas_atualizadas: totais.atualizadas,
+      linhas_atualizadas: 0,
       linhas_rejeitadas: 0,
     });
   }
 
-  const gravadas = totais.inseridas + totais.atualizadas;
+  const gravadas = totais.inseridas;
   const sufixoErro =
     totais.comErro > 0 ? ` · ${totais.comErro} arquivo(s) com erro` : '';
 
@@ -548,10 +545,10 @@ async function rodarEtapas(
     throw new Error(detalhe);
   }
 
-  if (totais.naoGravadas > 0) {
+  if (totais.substituidas > 0) {
     await registro.info(
-      `${numeroBR(totais.naoGravadas)} linhas lidas e não gravadas: iguais às já gravadas, ` +
-        'repetidas no arquivo (vale a última) ou sem gtin, loja, data ou preço legível',
+      `${numeroBR(totais.substituidas)} linhas de cargas anteriores destes arquivos substituídas ` +
+        '(reprocessamento)',
     );
   }
 
@@ -561,7 +558,7 @@ async function rodarEtapas(
   );
   await registro.concluirEtapa(
     'Merge incremental',
-    `UPSERT → fact_preco_coletado · ${numeroBR(gravadas)} · ` +
+    `INSERT → fact_preco_coletado · ${numeroBR(gravadas)} · ` +
       `${totais.arquivosIngeridos} de ${aptos.length} arquivos efetivados`,
   );
 
@@ -595,8 +592,7 @@ async function rodarEtapas(
     watermark_novo: runDate,
   });
   await registro.info(
-    `${numeroBR(gravadas)} linhas efetivadas · ${numeroBR(totais.inseridas)} inseridas · ` +
-      `${numeroBR(totais.atualizadas)} atualizadas · watermark ${runDate}`,
+    `${numeroBR(gravadas)} linhas inseridas · watermark ${runDate}`,
   );
 
   // ── 10 · Notificação ──────────────────────────────────────────────────────
@@ -619,14 +615,14 @@ async function rodarEtapas(
     linhasStaging: totais.linhas,
     linhasGravadas: gravadas,
     linhasInseridas: totais.inseridas,
-    linhasAtualizadas: totais.atualizadas,
+    linhasAtualizadas: 0,
     linhasRejeitadas: 0,
   };
 }
 
 /**
  * Leva um arquivo direto à tabela final, numa transação só: COPY nativo para
- * uma tabela temporária, um UPSERT no fato e a trilha do arquivo. Qualquer
+ * uma tabela temporária, o INSERT no fato e a trilha do arquivo. Qualquer
  * falha reverte apenas este arquivo.
  */
 async function processarArquivo(
@@ -635,7 +631,7 @@ async function processarArquivo(
   controle: ControleCancelamento,
   acompanhamento: AcompanhamentoArquivo,
 ): Promise<ResultadoCargaRapida> {
-  // `longa`: o UPSERT de um arquivo grande passa do teto de 30s aplicado às
+  // `longa`: o INSERT de um arquivo grande passa do teto de 30s aplicado às
   // consultas de tela.
   return emTransacao(async (cliente) => {
     // Com o backend registrado, uma parada interrompe a consulta em curso no
@@ -675,20 +671,19 @@ async function processarArquivo(
         throw new Error(`schema divergente · sem ${faltando.join(', ')}`);
       }
 
-      const gravadas = carga.inseridas + carga.atualizadas;
       await cliente.query(
         `UPDATE infoprice.ctl_execucao_arquivo
             SET linhas_lidas = $3,
                 linhas_gravadas = $4,
                 linhas_rejeitadas = 0,
                 linhas_inseridas = $5,
-                linhas_atualizadas = $6,
+                linhas_atualizadas = 0,
                 destino = 'copy → fact',
                 status = 'ingerido',
                 erro = NULL,
                 ingerido_em = now()
           WHERE id_execucao = $1 AND id_arquivo = $2`,
-        [registro.id, arquivo.idArquivo, carga.linhas, gravadas, carga.inseridas, carga.atualizadas],
+        [registro.id, arquivo.idArquivo, carga.linhas, carga.inseridas, carga.inseridas],
       );
 
       // O inventário guarda só a situação atual do arquivo na origem.
@@ -700,10 +695,7 @@ async function processarArquivo(
       );
 
       // O COMMIT roda logo depois deste retorno, em emTransacao.
-      await acompanhamento.fase(
-        'COMMIT',
-        `${numeroBR(carga.inseridas)} inseridas · ${numeroBR(carga.atualizadas)} atualizadas`,
-      );
+      await acompanhamento.fase('COMMIT', `${numeroBR(carga.inseridas)} inseridas`);
       return carga;
     });
   }, { longa: true });
@@ -758,13 +750,26 @@ async function garantirParticoesDoPeriodo(runDate: string): Promise<number> {
     [runDate, MESES_ANTES],
   );
   const criadas = rows[0]?.criadas ?? 0;
-  if (criadas === 0) return 0;
+  // A DEFAULT recebe a linha sem data legível ou fora dos meses do período. É
+  // criada pela migração 013 e conferida aqui, porque "Zerar base" apaga todas
+  // as partições. Vem depois dos meses: criar um mês com a DEFAULT já
+  // existente obriga o banco a varrê-la.
+  const garantirDefault = () =>
+    pool.query(
+      `CREATE TABLE IF NOT EXISTS infoprice.fact_preco_coletado_default
+         PARTITION OF infoprice.fact_preco_coletado DEFAULT`,
+    );
+  if (criadas === 0) {
+    await garantirDefault();
+    return 0;
+  }
   for (let i = MESES_ANTES; i >= -1; i -= 1) {
     await pool.query(
       `SELECT infoprice.garantir_particao((date_trunc('month', $1::date) - make_interval(months => $2))::date)`,
       [runDate, i],
     );
   }
+  await garantirDefault();
   return criadas;
 }
 

@@ -4,8 +4,8 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { stringify } from 'csv-stringify';
 import copiar from 'pg-copy-streams';
-import { config } from '../config.js';
 import type { Cliente } from '../db/pool.js';
+import { numeroBR } from '../util/formato.js';
 import { ExecucaoCancelada } from './cancelamento.js';
 import { COLUNAS_ORIGEM } from './colunas-origem.js';
 import { lerCabecalho, lerCsv, NULO, type InfoCabecalho } from './leitor-csv.js';
@@ -18,25 +18,17 @@ const { from: copyFrom } = copiar;
  * 1. O próprio PostgreSQL lê o CSV (COPY nativo) para uma tabela temporária
  *    com uma coluna de texto por coluna do arquivo. Tabela temporária não tem
  *    índice nem WAL: é a escrita mais barata que o banco oferece.
- * 2. Um INSERT … SELECT converte e grava tudo em fact_preco_coletado.
+ * 2. Um INSERT … SELECT converte e grava todas as linhas em
+ *    fact_preco_coletado.
  *
- * Nada é validado além do que a tabela final exige para aceitar a linha:
- * chave (gtin, loja, data) preenchida, data legível e preço que caiba em
- * numeric(12,2). A linha que não tem isso não tem como ser gravada e é só
- * contada — não vai para ctl_rejeicao.
+ * Inserção seca: nenhuma linha é verificada nem descartada. O fato não tem
+ * chave nem NOT NULL nos dados (migração 013), e a linha sem data legível vai
+ * para a partição DEFAULT. Reprocessar um arquivo apaga antes as linhas que
+ * ele mesmo gravou, então o arquivo nunca fica duplicado por reprocessamento.
  *
  * Se o COPY nativo recusar o arquivo (aspas fora do padrão, byte inválido), o
  * arquivo é relido pelo leitor tolerante em Node, mais lento, e segue igual.
  */
-
-/** O maior valor que cabe em numeric(12,2), com o arredondamento da coluna. */
-const LIMITE_PRECO = '9999999999.995';
-
-/** O UPSERT recusa o comando que atualizaria a mesma chave duas vezes. */
-const ERRO_LINHA_REPETIDA = '21000';
-
-/** "no partition of relation … found for row": a data não tem partição. */
-const ERRO_SEM_PARTICAO = '23514';
 
 export interface ParametrosCargaRapida {
   cliente: Cliente;
@@ -50,7 +42,7 @@ export interface ParametrosCargaRapida {
   aoProgresso: (linhas: number) => Promise<void>;
   /** A gravação no fato começou. */
   aoGravar: () => Promise<void>;
-  /** Algo que mudou o caminho da gravação (deduplicar, criar partição). */
+  /** Algo a registrar no log durante a gravação. */
   aoAviso: (texto: string) => Promise<void>;
   /** O COPY nativo recusou o arquivo e ele vai ser relido em modo tolerante. */
   aoReler: (motivo: string) => Promise<void>;
@@ -59,15 +51,13 @@ export interface ParametrosCargaRapida {
 export interface ResultadoCargaRapida {
   linhas: number;
   inseridas: number;
-  atualizadas: number;
-  /** Lidas e não gravadas: sem chave ou preço, repetidas ou iguais às já gravadas. */
-  naoGravadas: number;
+  /** Linhas da carga anterior deste mesmo arquivo, apagadas antes de gravar. */
+  substituidas: number;
   modo: 'nativo' | 'tolerante';
   /** Só no modo tolerante. */
   recuperadas: number;
   malformadas: number;
   cabecalho: string[];
-  particoes: string[];
 }
 
 export async function carregarArquivoRapido(
@@ -78,10 +68,9 @@ export async function carregarArquivoRapido(
   const n = info.colunas.length;
   const colunas = Array.from({ length: n }, (_, i) => `c${i + 1}`);
 
-  // Ordenação e hash da deduplicação em memória, e COMMIT sem esperar o
-  // disco: se o banco cair antes do flush, o arquivo inteiro volta como não
-  // gravado (a trilha está na mesma transação) e a varredura o refaz.
-  await cliente.query(`SET LOCAL work_mem = '${config.coleta.memoriaCarga}'`);
+  // COMMIT sem esperar o disco: se o banco cair antes do flush, o arquivo
+  // inteiro volta como não gravado (a trilha está na mesma transação) e a
+  // varredura o refaz.
   await cliente.query('SET LOCAL synchronous_commit = off');
 
   await cliente.query(
@@ -115,70 +104,26 @@ export async function carregarArquivoRapido(
   const x = expressoes(info);
 
   // ── 2 · gravação no fato ────────────────────────────────────────────────
-  // Primeiro do jeito mais rápido: sem deduplicar e sem procurar quais meses o
-  // arquivo traz — as partições dos últimos dois anos já foram criadas no
-  // início da coleta. Se o PostgreSQL recusar, o motivo diz o que fazer:
-  // - chave repetida no arquivo (uma linha não pode ser atualizada duas vezes
-  //   no mesmo comando): refaz ficando com a última ocorrência de cada chave;
-  // - data sem partição: cria as partições que faltam e refaz.
   await p.aoGravar();
-  const particoes: string[] = [];
-  let deduplicar = false;
-  let gravadas: { inseridas: number; atualizadas: number } | null = null;
-  for (let tentativa = 1; gravadas === null; tentativa += 1) {
-    await cliente.query('SAVEPOINT gravacao');
-    try {
-      gravadas = await gravar(cliente, x, p, deduplicar);
-    } catch (erro) {
-      const codigo = (erro as { code?: string }).code;
-      const repetida = codigo === ERRO_LINHA_REPETIDA && !deduplicar;
-      const semParticao = codigo === ERRO_SEM_PARTICAO && particoes.length === 0;
-      if (tentativa > 3 || (!repetida && !semParticao)) throw erro;
-      await cliente.query('ROLLBACK TO SAVEPOINT gravacao');
-      if (repetida) {
-        deduplicar = true;
-        await p.aoAviso('chave repetida no arquivo · refazendo com a última ocorrência de cada chave');
-      } else {
-        particoes.push(...(await criarParticoesDoArquivo(cliente, x)));
-        await p.aoAviso(`data fora das partições existentes · criadas ${particoes.join(', ')} · refazendo`);
-      }
-    }
+  // Reprocessamento: o que este arquivo gravou antes sai, e entra de novo.
+  const { rowCount: substituidas } = await cliente.query(
+    'DELETE FROM infoprice.fact_preco_coletado WHERE id_arquivo = $1',
+    [p.idArquivo],
+  );
+  if (substituidas) {
+    await p.aoAviso(`${numeroBR(substituidas)} linhas da carga anterior deste arquivo substituídas`);
   }
+  const inseridas = await gravar(cliente, x, p);
 
   return {
     linhas,
-    inseridas: gravadas.inseridas,
-    atualizadas: gravadas.atualizadas,
-    naoGravadas: linhas - gravadas.inseridas - gravadas.atualizadas,
+    inseridas,
+    substituidas: substituidas ?? 0,
     modo,
     recuperadas,
     malformadas,
     cabecalho: info.colunas,
-    particoes,
   };
-}
-
-/**
- * As partições mensais que as datas do arquivo pedem e ainda não existem.
- * Criar partição trava a tabela final até o fim desta transação — por isso só
- * acontece quando o arquivo traz data fora dos meses criados no início.
- */
-async function criarParticoesDoArquivo(cliente: Cliente, x: Expressoes): Promise<string[]> {
-  const { rows: meses } = await cliente.query<{ mes: string }>(
-    `SELECT DISTINCT date_trunc('month', ${x.data})::date::text AS mes
-       FROM carga_arquivo r
-      WHERE ${x.data} IS NOT NULL`,
-  );
-  const criadas: string[] = [];
-  for (const { mes } of meses) {
-    const { rows } = await cliente.query<{ nome: string; existia: boolean }>(
-      `SELECT to_regclass('infoprice.fact_preco_coletado_' || to_char($1::date, 'YYYY_MM')) IS NOT NULL AS existia,
-              infoprice.garantir_particao($1::date) AS nome`,
-      [mes],
-    );
-    if (rows[0] && !rows[0].existia) criadas.push(rows[0].nome);
-  }
-  return criadas;
 }
 
 /** O arquivo, descompactado, direto no COPY do PostgreSQL. */
@@ -283,21 +228,10 @@ async function copiaTolerante(
 }
 
 interface Expressoes {
-  gtin: string;
-  loja: string;
-  data: string;
-  preco: string;
   /** Colunas do fato (sem as de controle) e a expressão de cada uma. */
   campos: [string, string][];
 }
 
-/**
- * As expressões SQL que levam as colunas do arquivo (c1…cN) às do fato. Os
- * mesmos nomes, sinônimos e derivações do leitor (ver leitor-csv.ts): entre
- * colunas que caem no mesmo nome interno vale o primeiro valor não vazio, e
- * preço, promoção e tipo de preço saem de preco_regular, preco_pago e
- * flag_promocao.
- */
 /**
  * Conversão de texto para número e data escrita direto na consulta.
  *
@@ -318,44 +252,41 @@ function data(v: string): string {
     `WHEN ${v} IS NULL THEN NULL ELSE infoprice.para_data(${v}) END`;
 }
 
+/**
+ * As expressões SQL que levam as colunas do arquivo (c1…cN) às do fato. Os
+ * mesmos nomes, sinônimos e derivações do leitor (ver leitor-csv.ts): entre
+ * colunas que caem no mesmo nome interno vale o primeiro valor não vazio, e
+ * preço, promoção e tipo de preço saem de preco_regular, preco_pago e
+ * flag_promocao. O texto vai como veio, sem aparar.
+ */
 function expressoes(info: InfoCabecalho): Expressoes {
-  // As colunas da chave e do preço são aparadas: " 789" e "789" não podem
-  // virar duas chaves. As descritivas vão como vieram (inserção seca).
-  const primeiro = (indices: number[], aparar = true) => {
-    const partes = indices.map((i) =>
-      aparar ? `NULLIF(btrim(r.c${i + 1}), '')` : `NULLIF(r.c${i + 1}, '')`,
-    );
+  const primeiro = (indices: number[]) => {
+    const partes = indices.map((i) => `NULLIF(r.c${i + 1}, '')`);
     if (partes.length === 0) return 'NULL::text';
     return partes.length === 1 ? partes[0]! : `COALESCE(${partes.join(', ')})`;
   };
   const indices = (nomes: string[], alvo: string) =>
     nomes.flatMap((nome, i) => (nome === alvo ? [i] : []));
   /** Campo interno (gtin, id_loja, preco…), com sinônimos. */
-  const campo = (nome: string, aparar = true) => primeiro(indices(info.colunas, nome), aparar);
-  /** Coluna do arquivo pelo nome original, sem aparar. */
-  const original = (nome: string) => primeiro(indices(info.nomesOriginais, nome), false);
+  const campo = (nome: string) => primeiro(indices(info.colunas, nome));
+  /** Coluna do arquivo pelo nome original. */
+  const original = (nome: string) => primeiro(indices(info.nomesOriginais, nome));
 
   const promocao = `COALESCE(${campo('flag_promocao')} ~* '^(true|1|s|sim|y|yes)$', false)`;
   const precoPromocional = numero(
     `COALESCE(${campo('preco_promocional')}, CASE WHEN ${promocao} THEN ${campo('preco_pago')} END)`,
   );
 
-  const gtin = campo('gtin');
-  const loja = campo('id_loja');
-  const dataColeta = data(campo('data_coleta'));
-  const preco = numero(`COALESCE(${campo('preco')}, ${campo('preco_pago')})`);
-
   const campos: [string, string][] = [
-    ['gtin', gtin],
-    ['id_loja', loja],
-    ['data_coleta', dataColeta],
-    ['descricao', campo('descricao', false)],
-    ['rede', campo('rede', false)],
-    ['uf', campo('uf', false)],
-    ['municipio', campo('municipio', false)],
-    ['preco', preco],
-    // Um promocional que não cabe na coluna fica vazio em vez de derrubar o arquivo.
-    ['preco_promocional', `CASE WHEN abs(${precoPromocional}) < ${LIMITE_PRECO} THEN ${precoPromocional} END`],
+    ['gtin', campo('gtin')],
+    ['id_loja', campo('id_loja')],
+    ['data_coleta', data(campo('data_coleta'))],
+    ['descricao', campo('descricao')],
+    ['rede', campo('rede')],
+    ['uf', campo('uf')],
+    ['municipio', campo('municipio')],
+    ['preco', numero(`COALESCE(${campo('preco')}, ${campo('preco_pago')})`)],
+    ['preco_promocional', precoPromocional],
     [
       'tipo_preco',
       `COALESCE(${campo('tipo_preco')}, CASE WHEN ${campo('flag_promocao')} IS NOT NULL ` +
@@ -369,79 +300,34 @@ function expressoes(info: InfoCabecalho): Expressoes {
     }),
   ];
 
-  return { gtin, loja, data: dataColeta, preco, campos };
+  return { campos };
 }
 
-/** O UPSERT do arquivo inteiro em fact_preco_coletado. */
+/** Todas as linhas da tabela temporária em fact_preco_coletado, sem filtro. */
 async function gravar(
   cliente: Cliente,
   x: Expressoes,
   p: ParametrosCargaRapida,
-  deduplicar: boolean,
-): Promise<{ inseridas: number; atualizadas: number }> {
-  // O mínimo para a linha caber no fato: chave preenchida e preço válido.
-  const gravavel =
-    `${x.gtin} IS NOT NULL AND ${x.loja} IS NOT NULL AND ${x.data} IS NOT NULL ` +
-    `AND ${x.preco} IS NOT NULL AND abs(${x.preco}) < ${LIMITE_PRECO}`;
-  const ultimas = deduplicar
-    ? `AND r._n IN (
-         SELECT max(r._n) FROM carga_arquivo r
-          WHERE ${gravavel}
-          GROUP BY ${x.gtin}, ${x.loja}, ${x.data}
-       )`
-    : '';
-
-  const nomes = x.campos.map(([nome]) => nome);
-  // Chave e controle ficam de fora do SET; descrição, rede, UF e cidade não
-  // apagam o que já existe quando a linha nova vem sem elas.
-  const preservados = new Set(['descricao', 'rede', 'uf', 'municipio']);
-  const atualizaveis = nomes.filter((c) => !['gtin', 'id_loja', 'data_coleta'].includes(c));
-  const novo = (c: string) => (preservados.has(c) ? `COALESCE(EXCLUDED.${c}, f.${c})` : `EXCLUDED.${c}`);
-
-  const { rows } = await cliente.query<{ inseridas: number; atualizadas: number }>(
-    `WITH gravadas AS (
-       INSERT INTO infoprice.fact_preco_coletado AS f (
-         ${nomes.join(', ')}, fonte, id_execucao, id_arquivo, numero_linha
-       )
-       SELECT ${x.campos.map(([, expr]) => expr).join(',\n              ')},
-              $1, $2::bigint, $3::bigint, r._n
-         FROM carga_arquivo r
-        WHERE ${gravavel}
-        ${ultimas}
-       ON CONFLICT (gtin, id_loja, data_coleta, fonte) DO UPDATE
-          SET ${atualizaveis.map((c) => `${c} = ${novo(c)}`).join(',\n              ')},
-              id_execucao   = EXCLUDED.id_execucao,
-              id_arquivo    = EXCLUDED.id_arquivo,
-              numero_linha  = EXCLUDED.numero_linha,
-              atualizado_em = now()
-        -- Só reescreve a linha que mudou de fato: reprocessar o mesmo arquivo
-        -- não toca no que já está igual.
-        WHERE (${atualizaveis.map((c) => `f.${c}`).join(', ')})
-              IS DISTINCT FROM
-              (${atualizaveis.map(novo).join(', ')})
-       RETURNING (f.criado_em = f.atualizado_em) AS foi_insert
+): Promise<number> {
+  const { rowCount } = await cliente.query(
+    `INSERT INTO infoprice.fact_preco_coletado (
+       ${x.campos.map(([nome]) => nome).join(', ')}, fonte, id_execucao, id_arquivo, numero_linha
      )
-     SELECT count(*) FILTER (WHERE foi_insert)::bigint     AS inseridas,
-            count(*) FILTER (WHERE NOT foi_insert)::bigint AS atualizadas
-       FROM gravadas`,
+     SELECT ${x.campos.map(([, expr]) => expr).join(',\n            ')},
+            $1, $2::bigint, $3::bigint, r._n
+       FROM carga_arquivo r`,
     [p.fonte, p.idExecucao, p.idArquivo],
   );
-  return rows[0] ?? { inseridas: 0, atualizadas: 0 };
+  return rowCount ?? 0;
 }
 
-/**
- * O comando de persistência exibido na tela de detalhe da execução — o
- * mesmo que gravar() monta.
- */
+/** O comando de persistência exibido na tela de detalhe da execução. */
 export const SQL_PERSISTENCIA = `-- 1 · o PostgreSQL lê o arquivo direto, para uma tabela temporária
 COPY carga_arquivo FROM STDIN (FORMAT csv, HEADER, DELIMITER '|', NULL '\\N');
 
--- 2 · uma instrução grava o arquivo inteiro, sem regras de qualidade
-INSERT INTO infoprice.fact_preco_coletado AS f
-SELECT … FROM carga_arquivo             -- todas as colunas, já convertidas
-WHERE gtin, loja, data e preço legíveis  -- o mínimo que a tabela exige
-ON CONFLICT (gtin, id_loja, data_coleta, fonte)
-DO UPDATE SET preco = EXCLUDED.preco, …,  -- e as demais colunas
-              id_execucao = EXCLUDED.id_execucao,
-              atualizado_em = now()
-WHERE (f.preco, …) IS DISTINCT FROM (EXCLUDED.preco, …);  -- só se algo mudou`;
+-- 2 · reprocessamento: sai o que este arquivo gravou antes
+DELETE FROM infoprice.fact_preco_coletado WHERE id_arquivo = :arquivo;
+
+-- 3 · inserção seca: todas as linhas, sem chave, filtro ou verificação
+INSERT INTO infoprice.fact_preco_coletado
+SELECT … FROM carga_arquivo;   -- todas as colunas, já convertidas`;

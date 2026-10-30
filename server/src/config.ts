@@ -166,13 +166,6 @@ export const config = {
     janelaColetaDias: numero('JANELA_COLETA_DIAS', 365),
     cadastrarLojas: booleano('CADASTRAR_LOJAS', true),
     /**
-     * work_mem da transação de carga: a deduplicação (quando o arquivo repete
-     * uma chave) e as partições cabem em memória em vez de irem para o disco.
-     */
-    memoriaCarga: /^\d+\s*(kB|MB|GB)$/i.test(texto('PG_MEMORIA_CARGA', ''))
-      ? texto('PG_MEMORIA_CARGA', '')
-      : '256MB',
-    /**
      * SHA-256 também do conteúdo descompactado. Exige descompactar cada
      * arquivo só para o hash — na prática, ler a pasta inteira mais uma vez.
      * O hash do arquivo como chegou é sempre calculado.
